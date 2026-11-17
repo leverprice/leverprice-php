@@ -1,13 +1,14 @@
+<p>
 <a href="https://leverprice.com">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/leverprice/.github/main/assets/repo/php-dark.svg">
     <img alt="Leverprice SDK for PHP" src="https://raw.githubusercontent.com/leverprice/.github/main/assets/repo/php-light.svg" width="100%">
   </picture>
 </a>
+</p>
 
 <p>
   <a href="https://packagist.org/packages/leverprice/leverprice-php"><img alt="Packagist" src="https://img.shields.io/packagist/v/leverprice/leverprice-php?label=packagist&style=flat-square&labelColor=0F1011&color=5B4CF5"></a>
-  <a href="https://packagist.org/packages/leverprice/leverprice-php"><img alt="PHP version" src="https://img.shields.io/packagist/dependency-v/leverprice/leverprice-php/php?label=php&style=flat-square&labelColor=0F1011&color=5B4CF5"></a>
   <a href="https://github.com/leverprice/leverprice-php/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/leverprice/leverprice-php/ci.yml?branch=main&label=ci&style=flat-square&labelColor=0F1011"></a>
   <a href="https://github.com/leverprice/leverprice-php/blob/main/LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-5B4CF5?style=flat-square&labelColor=0F1011"></a>
 </p>
