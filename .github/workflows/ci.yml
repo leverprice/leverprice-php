@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: PHP ${{ matrix.php }} · ${{ matrix.os }} · ${{ matrix.ed25519 }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        php: ['8.1', '8.2', '8.3', '8.4', '8.5']
+        ed25519: [ext-sodium, sodium_compat]
+        dependencies: [highest]
+        include:
+          - os: ubuntu-latest
+            php: '8.1'
+            ed25519: ext-sodium
+            dependencies: lowest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: ${{ matrix.ed25519 == 'ext-sodium' && 'curl, sodium' || 'curl, :sodium' }}
+          ini-values: zend.assertions=1, error_reporting=-1, display_errors=On
+          coverage: none
+
+      - uses: ramsey/composer-install@v3
+        with:
+          dependency-versions: ${{ matrix.dependencies }}
+
+      - name: Run tests
+        run: vendor/bin/phpunit
+        env:
+          LEVERPRICE_TEST_SODIUM_COMPAT: ${{ matrix.ed25519 == 'sodium_compat' && '1' || '0' }}
+
+  without-curl:
+    name: PHP 8.5 · stream transport · APCu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: ':curl, apcu'
+          ini-values: apc.enable_cli=1
+          coverage: none
+
+      - uses: ramsey/composer-install@v3
+
+      - name: Run tests
+        run: vendor/bin/phpunit
+
+  quality:
+    name: Static analysis and coding style
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          tools: php-cs-fixer
+          coverage: none
+
+      - name: Validate composer.json
+        run: composer validate --strict
+
+      - uses: ramsey/composer-install@v3
+
+      - name: PHPStan
+        run: vendor/bin/phpstan analyse --no-progress
+
+      - name: PHP CS Fixer
+        run: php-cs-fixer check --diff
