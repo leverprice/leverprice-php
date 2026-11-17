@@ -8,9 +8,9 @@
 </p>
 
 <p>
-  <a href="https://packagist.org/packages/leverprice/leverprice-php"><img alt="Packagist" src="https://img.shields.io/packagist/v/leverprice/leverprice-php?label=packagist&style=flat-square&labelColor=0F1011&color=5B4CF5"></a>
+  <a href="https://packagist.org/packages/leverprice/leverprice-php"><img alt="Packagist" src="https://img.shields.io/packagist/v/leverprice/leverprice-php?label=packagist&style=flat-square&labelColor=0F1011&color=3C3F44"></a>
   <a href="https://github.com/leverprice/leverprice-php/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/leverprice/leverprice-php/ci.yml?branch=main&label=ci&style=flat-square&labelColor=0F1011"></a>
-  <a href="https://github.com/leverprice/leverprice-php/blob/main/LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-5B4CF5?style=flat-square&labelColor=0F1011"></a>
+  <a href="https://github.com/leverprice/leverprice-php/blob/main/LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-3C3F44?style=flat-square&labelColor=0F1011"></a>
 </p>
 
 Server-side SDK for [Leverprice](https://leverprice.com) price experiments. PHP 8.1+ (64-bit), no runtime dependencies beyond `ext-json`. Works with Laravel, Symfony, any PSR-7 framework and plain PHP, under PHP-FPM and in worker mode (Octane, FrankenPHP, RoadRunner, Swoole).
