@@ -31,6 +31,12 @@ final class HttpResponse
         return $values === [] ? null : implode(', ', $values);
     }
 
+    /** @return array<string, list<string>> lower-case names */
+    public function headers(): array
+    {
+        return $this->headers;
+    }
+
     public function ok(): bool
     {
         return $this->status >= 200 && $this->status < 300;

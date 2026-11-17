@@ -27,18 +27,21 @@ final class TransportTest extends TestCase
     /** @var resource|null */
     private static $server = null;
     private static string $base = '';
+    /** @var resource|null */
+    private static $keepAlive = null;
+    private static string $keepAliveBase = '';
 
     public static function setUpBeforeClass(): void
     {
         $port = self::freePort();
         $command = [PHP_BINARY, '-S', '127.0.0.1:' . $port, __DIR__ . '/Support/server.php'];
-        $process = proc_open($command, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+        $process = proc_open($command, [0 => ['pipe', 'r'], 1 => ['file', self::nullDevice(), 'w'], 2 => ['file', self::nullDevice(), 'w']], $pipes);
         if (!is_resource($process)) {
             return;
         }
         self::$server = $process;
         self::$base = 'http://127.0.0.1:' . $port;
-        for ($i = 0; $i < 100; $i++) {
+        for ($i = 0; $i < 200; $i++) {
             $socket = @fsockopen('127.0.0.1', $port, $errno, $error, 0.1);
             if (is_resource($socket)) {
                 fclose($socket);
@@ -51,9 +54,11 @@ final class TransportTest extends TestCase
 
     public static function tearDownAfterClass(): void
     {
-        if (is_resource(self::$server)) {
-            proc_terminate(self::$server);
-            proc_close(self::$server);
+        foreach ([self::$server, self::$keepAlive] as $process) {
+            if (is_resource($process)) {
+                proc_terminate($process);
+                proc_close($process);
+            }
         }
     }
 
@@ -93,6 +98,16 @@ final class TransportTest extends TestCase
 
         $redirect = $transport->send(new HttpRequest('GET', self::$base . '/redirect', [], null, 5000));
         self::assertSame(302, $redirect->status);
+    }
+
+    #[DataProvider('transports')]
+    public function testDoesNotWaitForTheServerToCloseTheConnection(Transport $transport): void
+    {
+        $base = self::keepAliveServer();
+        $start = microtime(true);
+        $response = $transport->send(new HttpRequest('GET', $base . '/v1/config', [], null, 4000));
+        self::assertSame([200, '{"ok":true}'], [$response->status, $response->body]);
+        self::assertLessThan(2.0, microtime(true) - $start);
     }
 
     #[DataProvider('transports')]
@@ -191,6 +206,30 @@ final class TransportTest extends TestCase
         if (self::$base === '') {
             self::markTestSkipped('could not start the PHP built-in server');
         }
+    }
+
+    private static function keepAliveServer(): string
+    {
+        if (self::$keepAliveBase === '') {
+            $command = [PHP_BINARY, __DIR__ . '/Support/keepalive.php'];
+            $process = proc_open($command, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['file', self::nullDevice(), 'w']], $pipes);
+            if (!is_resource($process)) {
+                self::markTestSkipped('could not start the keep-alive server');
+            }
+            self::$keepAlive = $process;
+            $address = trim((string) fgets($pipes[1]));
+            if ($address === '') {
+                self::markTestSkipped('the keep-alive server did not start');
+            }
+            self::$keepAliveBase = 'http://' . $address;
+        }
+
+        return self::$keepAliveBase;
+    }
+
+    private static function nullDevice(): string
+    {
+        return DIRECTORY_SEPARATOR === '\\' ? 'NUL' : '/dev/null';
     }
 
     private static function freePort(): int

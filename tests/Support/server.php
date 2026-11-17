@@ -11,26 +11,26 @@ foreach ($_SERVER as $name => $value) {
     }
 }
 
-if ($path === '/v1/config') {
-    header('ETag: "v9"');
-    header('Leverprice-Config-Version: 9');
-    header('Content-Type: application/json');
-    echo json_encode(['method' => $_SERVER['REQUEST_METHOD'], 'headers' => $headers]);
+$respond = static function (int $status, string $body, string ...$extra): bool {
+    http_response_code($status);
+    foreach ($extra as $line) {
+        header($line);
+    }
+    header('Content-Length: ' . strlen($body));
+    echo $body;
 
     return true;
-}
-if ($path === '/v1/events') {
-    http_response_code(202);
-    echo json_encode(['body' => file_get_contents('php://input'), 'headers' => $headers]);
+};
 
-    return true;
-}
-if ($path === '/redirect') {
-    header('Location: /v1/config', true, 302);
-
-    return true;
-}
-http_response_code(404);
-echo '{"error":{"code":"not_found"}}';
-
-return true;
+return match ($path) {
+    '/v1/config' => $respond(
+        200,
+        (string) json_encode(['method' => $_SERVER['REQUEST_METHOD'] ?? '', 'headers' => $headers]),
+        'ETag: "v9"',
+        'Leverprice-Config-Version: 9',
+        'Content-Type: application/json',
+    ),
+    '/v1/events' => $respond(202, (string) json_encode(['body' => file_get_contents('php://input'), 'headers' => $headers])),
+    '/redirect' => $respond(302, '', 'Location: /v1/config'),
+    default => $respond(404, '{"error":{"code":"not_found"}}'),
+};

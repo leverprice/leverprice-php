@@ -8,6 +8,7 @@ namespace Leverprice\Http;
 final class StreamTransport implements Transport
 {
     private const MAX_BODY_BYTES = 8388608;
+    private const TIMER_SLACK_SECONDS = 0.05;
 
     public function send(HttpRequest $request): HttpResponse
     {
@@ -24,7 +25,7 @@ final class StreamTransport implements Transport
             'timeout' => $seconds,
             'ignore_errors' => true,
             'follow_location' => 0,
-            'protocol_version' => 1.1,
+            'protocol_version' => 1.0,
         ]]);
 
         $error = null;
@@ -40,20 +41,27 @@ final class StreamTransport implements Transport
         }
         if ($stream === false) {
             $message = is_string($error) ? $error : 'request failed';
+            $timedOut = microtime(true) >= $deadline - self::TIMER_SLACK_SECONDS || stripos($message, 'timed out') !== false;
 
-            throw new TransportException($message, microtime(true) >= $deadline || stripos($message, 'timed out') !== false);
+            throw new TransportException($message, $timedOut);
         }
 
         try {
             $meta = stream_get_meta_data($stream);
+            $head = self::head(is_array($meta['wrapper_data'] ?? null) ? $meta['wrapper_data'] : []);
+            $length = $head->header('Content-Length');
+            $expected = $length !== null && preg_match('/^\d{1,10}$/D', $length) === 1 ? (int) $length : null;
+            if ($expected !== null && $expected > self::MAX_BODY_BYTES) {
+                throw new TransportException('response body too large');
+            }
             $body = '';
-            while (!feof($stream)) {
+            while (($expected === null || strlen($body) < $expected) && !feof($stream)) {
                 $left = $deadline - microtime(true);
                 if ($left <= 0) {
                     throw new TransportException('request timed out', true);
                 }
                 stream_set_timeout($stream, (int) $left, (int) (($left - floor($left)) * 1000000));
-                $chunk = fread($stream, 8192);
+                $chunk = fread($stream, $expected === null ? 8192 : max(1, min(8192, $expected - strlen($body))));
                 if ($chunk === false) {
                     break;
                 }
@@ -69,11 +77,11 @@ final class StreamTransport implements Transport
             fclose($stream);
         }
 
-        return self::response(is_array($meta['wrapper_data'] ?? null) ? $meta['wrapper_data'] : [], $body);
+        return new HttpResponse($head->status, $head->headers(), $body);
     }
 
     /** @param array<mixed> $lines */
-    private static function response(array $lines, string $body): HttpResponse
+    private static function head(array $lines): HttpResponse
     {
         $status = 0;
         $headers = [];
@@ -90,6 +98,6 @@ final class StreamTransport implements Transport
             }
         }
 
-        return new HttpResponse($status, $headers, $body);
+        return new HttpResponse($status, $headers);
     }
 }
