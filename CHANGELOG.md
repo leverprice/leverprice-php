@@ -2,6 +2,27 @@
 
 All notable changes to this package are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the package uses [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-11-18
+
+Cookies, cached state and the wire protocol are compatible with 0.3.
+
+### Changed
+
+- Limits set in code (`minPrice`, `maxPrice`) no longer hold prices: the product's range set in Leverprice applies. If your limits were tighter than that range, tighten it in the dashboard before you upgrade.
+
+### Added
+
+- Settings live in Leverprice, not in code: the product's price range and the header that carries the visitor's country (Project settings → Visitor country) arrive in the signed config. `minPrice` and `maxPrice` in code are no longer used; 0.3 code that sets them keeps compiling and running.
+- Regional prices: a product can cost something else in each country, in your currency or the visitor's. `country` in the `getPrice()` context, `country` / `regional` on the quote, and a `countryHeader` option that overrides the project setting. Prices in the visitor's currency need `'localCurrencies' => true` (set it when your checkout charges `$quote->currency`); `$quote->currency` is then the region's currency.
+- Exposures carry the visitor's country when it is known.
+- Tests by country: a test can run in selected countries only, and countries can be split between the prices their own way. Both are set in the dashboard; the SDK only needs the visitor's country.
+- `trackPurchase()` and `trackRefund()` accept the providers `paddle` and `creem`.
+
+### Fixed
+
+- Turbo 8 hover prefetches (`X-Sec-Purpose: prefetch`) are priced but no longer counted as exposures, like other prefetches.
+- README: the Stripe webhook counts only paid Checkout Sessions, handles `checkout.session.async_payment_succeeded`, reports a subscription's first payment by its PaymentIntent id (as verified webhooks do) and skips $0 sessions and passes the event time.
+
 ## [0.3.0] - 2026-11-17
 
 First release of the PHP SDK, implementing Leverprice server SDK protocol v2.
@@ -18,4 +39,5 @@ First release of the PHP SDK, implementing Leverprice server SDK protocol v2.
 - curl, PHP stream and PSR-18 transports.
 - Conformance with the shared vectors in `conformance/vectors.json`.
 
+[0.4.0]: https://github.com/leverprice/leverprice-php/releases/tag/v0.4.0
 [0.3.0]: https://github.com/leverprice/leverprice-php/releases/tag/v0.3.0

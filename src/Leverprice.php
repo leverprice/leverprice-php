@@ -21,6 +21,7 @@ use Leverprice\Internal\Flight;
 use Leverprice\Internal\Guard;
 use Leverprice\Internal\Outbox;
 use Leverprice\Internal\Product;
+use Leverprice\Internal\Region;
 use Leverprice\Internal\RequestInfo;
 use Leverprice\Internal\RequestReader;
 use Leverprice\Internal\RequestScope;
@@ -28,7 +29,6 @@ use Leverprice\Internal\SharedState;
 use Leverprice\Internal\Superglobals;
 use Leverprice\Internal\TrustChain;
 use Leverprice\Internal\Util;
-use Leverprice\Internal\Variant;
 use Leverprice\Internal\Wire;
 use Leverprice\State\ApcuStore;
 use Leverprice\State\FileStore;
@@ -45,23 +45,24 @@ use Psr\SimpleCache\CacheInterface;
 /**
  * Server-side client for Leverprice price experiments.
  *
- * @phpstan-type GetPriceContext array{request?: mixed, cookie?: ?string, userAgent?: ?string, userId?: string|int|\Stringable|null, exposure?: ?string, bot?: ?bool}
+ * @phpstan-type GetPriceContext array{request?: mixed, cookie?: ?string, userAgent?: ?string, userId?: string|int|\Stringable|null, country?: ?string, exposure?: ?string, bot?: ?bool}
  * @phpstan-type WireEvent array<string, mixed>
  */
 final class Leverprice
 {
-    public const SDK_VERSION = '0.3.0';
+    public const SDK_VERSION = '0.4.0';
     public const ROOT_PUBLIC_KEYS = ['r1' => '5FmNzXvPMPZEuDnFT_fFd_VVNsUrWwWTKLerMWbSdcg'];
     public const MIN_KEYSET_VERSION = 1;
 
     private const OPTIONS = [
         'secretKey', 'products', 'disabled', 'apiUrl', 'timeoutMs', 'refreshIntervalMs', 'maxStaleMs',
-        'cookieName', 'cookieMaxAgeSeconds', 'cookieSecure', 'cookieDomain', 'flushIntervalMs',
-        'trustedRootKeys', 'transport', 'httpClient', 'requestFactory', 'streamFactory', 'cache',
+        'cookieName', 'cookieMaxAgeSeconds', 'cookieSecure', 'cookieDomain', 'countryHeader', 'localCurrencies',
+        'flushIntervalMs', 'trustedRootKeys', 'transport', 'httpClient', 'requestFactory', 'streamFactory', 'cache',
         'onError', 'logger', 'clock', 'finishRequest', 'registerShutdown',
     ];
     private const KEY_RE = '/^pp_sk_(live|test)_[0-9A-Za-z]{40}$/D';
     private const COOKIE_NAME_RE = '/^[!#$%&\'*+\-.^_`|~0-9A-Za-z]+$/D';
+    private const HEADER_NAME_RE = self::COOKIE_NAME_RE;
     private const SIGNATURE_RE = '/^[0-9a-f]{16}$/D';
     private const PIN_MAX_AGE_SECONDS = 1800;
     private const REQUEST_TIMEOUT_MS = 10000;
@@ -92,6 +93,8 @@ final class Leverprice
     private readonly int $cookieMaxAge;
     private readonly bool $cookieSecure;
     private readonly ?string $cookieDomain;
+    private readonly ?string $countryHeader;
+    private readonly bool $localCurrencies;
     private readonly int $flushIntervalMs;
     private readonly Transport $transport;
     /** @var (\Closure(\Throwable): mixed)|null */
@@ -167,6 +170,12 @@ final class Leverprice
         }
         $this->cookieSecure = ($options['cookieSecure'] ?? true) !== false;
         $this->cookieDomain = self::stringOption($options, 'cookieDomain');
+        $countryHeader = trim(self::stringOption($options, 'countryHeader') ?? '', " \t\n\x0B\f\r");
+        if ($countryHeader !== '' && preg_match(self::HEADER_NAME_RE, $countryHeader) !== 1) {
+            throw new \InvalidArgumentException('Leverprice: countryHeader is not a valid header name');
+        }
+        $this->countryHeader = $countryHeader === '' ? null : strtolower($countryHeader);
+        $this->localCurrencies = ($options['localCurrencies'] ?? false) === true;
         $this->finishRequest = ($options['finishRequest'] ?? true) !== false;
         $this->registerShutdown = ($options['registerShutdown'] ?? true) !== false;
 
@@ -247,7 +256,7 @@ final class Leverprice
         try {
             $scope = $this->scope($context['request'] ?? null);
             $this->runOverdueWork($this->clock->now());
-            $request = RequestReader::read($context, $this->cookieName);
+            $request = RequestReader::read($context, $this->cookieName, $this->countryHeader);
             $verdict = $context['bot'] ?? null;
             $bot = is_bool($verdict) ? $verdict : Bots::isBot($request->userAgent);
             if ($bot) {
@@ -262,6 +271,9 @@ final class Leverprice
             if ($config === null) {
                 return $this->noConfig($productKey, $guard, $scope);
             }
+            if ($this->countryHeader === null && $config->countryHeader !== null && !is_string($context['country'] ?? null)) {
+                $request = $request->withCountry(RequestReader::headerCountry($context, $config->countryHeader));
+            }
             $product = $config->product($productKey);
             if ($product === null) {
                 return self::fallback($productKey, $guard, Quote::REASON_UNKNOWN_PRODUCT);
@@ -269,22 +281,28 @@ final class Leverprice
             if ($product->currency !== $guard->currency) {
                 return self::fallback($productKey, $guard, Quote::REASON_CURRENCY_MISMATCH);
             }
-            $experiment = $product->experiment;
+            $experiment = $product->experimentFor($request->country);
             if ($experiment === null) {
-                return $guard->allows($product, $product->price)
-                    ? self::priced($productKey, $guard, $product->price, Quote::REASON_BASE_PRICE, $product->checkoutUrl)
-                    : self::fallback($productKey, $guard, Quote::REASON_OUT_OF_BOUNDS);
+                if (!$product->inRange($product->price)) {
+                    return self::fallback($productKey, $guard, Quote::REASON_OUT_OF_BOUNDS);
+                }
+                $region = $this->regionFor($guard, $product, $request->country);
+
+                return $region === null
+                    ? self::priced($productKey, $guard, $product->price, Quote::REASON_BASE_PRICE, $product->checkoutUrl, $request->country)
+                    : self::regional($productKey, $region, $request->country);
             }
             if ($experiment->variants === []) {
                 return self::fallback($productKey, $guard, Quote::REASON_OUT_OF_BOUNDS);
             }
             foreach ($experiment->variants as $variant) {
-                if (!$guard->allows($product, $variant->price)) {
+                if (!$product->inRange($variant->price)) {
                     return self::fallback($productKey, $guard, Quote::REASON_OUT_OF_BOUNDS);
                 }
             }
+            $region = $this->regionFor($guard, $product, $request->country);
 
-            return $this->experimentQuote($productKey, $guard, $context, $request, $scope, $config, $product, $experiment);
+            return $this->experimentQuote($productKey, $guard, $context, $request, $scope, $config, $product, $experiment, $region);
         } catch (\Throwable $e) {
             $this->report($e);
 
@@ -308,7 +326,8 @@ final class Leverprice
             if ($quote->experimentId === null || $quote->variantId === null || $quote->visitorId === null) {
                 return false;
             }
-            $queued = $this->recordExposure($quote->experimentId, $quote->variantId, $quote->visitorId);
+            $country = RequestReader::normalizeCountry($quote->country);
+            $queued = $this->recordExposure($quote->experimentId, $quote->variantId, $quote->visitorId, $country);
             $quote->exposureLogged = true;
 
             return $queued;
@@ -484,6 +503,7 @@ final class Leverprice
         Config $config,
         Product $product,
         Experiment $experiment,
+        ?Region $region,
     ): Quote {
         $key = $this->hmacKey($config->assignmentKey);
         $userId = self::userIdOf($context['userId'] ?? null);
@@ -516,7 +536,7 @@ final class Leverprice
         $assigned = $state->variantFor($experiment->id);
         $variant = $assigned === null ? null : $experiment->variant($assigned);
         if ($variant === null) {
-            $weights = array_map(static fn(Variant $v): int => $v->weight, $experiment->variants);
+            $weights = $experiment->weightsFor($request->country);
             $variant = $experiment->variants[Util::pickVariant($weights, Util::bucketFor($experiment->salt, $visitorId))];
             $state->assign($experiment->id, $variant->id);
             $changed = true;
@@ -524,7 +544,7 @@ final class Leverprice
 
         $logged = in_array($experiment->id, $state->x, true) || isset($this->exposed[$experiment->id . ':' . $visitorId]);
         if (!$logged && ($context['exposure'] ?? 'auto') === 'auto' && !$request->prefetch) {
-            $this->recordExposure($experiment->id, $variant->id, $visitorId);
+            $this->recordExposure($experiment->id, $variant->id, $visitorId, $request->country);
             $logged = true;
         }
         if ($logged && $state->markExposed($experiment->id)) {
@@ -544,8 +564,8 @@ final class Leverprice
 
         return new Quote(
             $productKey,
-            $variant->price,
-            $guard->currency,
+            $region === null ? $variant->price : $variant->regional[$region->index],
+            $region === null ? $guard->currency : $region->currency,
             false,
             Quote::REASON_EXPERIMENT,
             $experiment->id,
@@ -553,16 +573,34 @@ final class Leverprice
             $visitorId,
             ['pp_exp' => $experiment->id, 'pp_var' => $variant->id, 'pp_vid' => $visitorId, 'pp_sig' => $signature],
             $setCookie,
-            $variant->checkoutUrl ?? $product->checkoutUrl,
+            $region === null ? ($variant->checkoutUrl ?? $product->checkoutUrl) : null,
             $logged,
+            $request->country,
+            $region !== null,
         );
+    }
+
+    private function regionFor(Guard $guard, Product $product, ?string $country): ?Region
+    {
+        if ($country === null) {
+            return null;
+        }
+        $region = $product->region($country);
+        if ($region === null) {
+            return null;
+        }
+        if ($region->currency !== $guard->currency && !$this->localCurrencies) {
+            return null;
+        }
+
+        return $region;
     }
 
     private function botQuote(string $productKey, Guard $guard): Quote
     {
         $product = $this->currentConfig()?->product($productKey);
-        if ($product !== null && $product->currency === $guard->currency && $guard->allows($product, $product->price)) {
-            return self::priced($productKey, $guard, $product->price, Quote::REASON_BOT, $product->checkoutUrl);
+        if ($product !== null && $product->currency === $guard->currency && $product->inRange($product->price)) {
+            return self::priced($productKey, $guard, $product->price, Quote::REASON_BOT, $product->checkoutUrl, null);
         }
 
         return self::fallback($productKey, $guard, Quote::REASON_BOT);
@@ -957,7 +995,7 @@ final class Leverprice
         return $s;
     }
 
-    private function recordExposure(string $experimentId, string $variantId, string $visitorId): bool
+    private function recordExposure(string $experimentId, string $variantId, string $visitorId, ?string $country): bool
     {
         $key = $experimentId . ':' . $visitorId;
         if (isset($this->exposed[$key])) {
@@ -967,14 +1005,18 @@ final class Leverprice
             $this->exposed = [];
         }
         $this->exposed[$key] = true;
-
-        return $this->enqueue([
+        $event = [
             'type' => 'exposure',
             'experimentId' => $experimentId,
             'variantId' => $variantId,
             'visitorId' => $visitorId,
             'timestamp' => $this->clock->now(),
-        ]);
+        ];
+        if ($country !== null && $country !== '') {
+            $event['country'] = $country;
+        }
+
+        return $this->enqueue($event);
     }
 
     /** @param WireEvent $event */
@@ -1355,12 +1397,17 @@ final class Leverprice
     /** @param list<string> $setCookie */
     private static function fallback(string $productKey, Guard $guard, string $reason, array $setCookie = []): Quote
     {
-        return new Quote($productKey, $guard->fallbackPrice, $guard->currency, true, $reason, null, null, null, [], $setCookie, null, false);
+        return new Quote($productKey, $guard->fallbackPrice, $guard->currency, true, $reason, null, null, null, [], $setCookie, null, false, null, false);
     }
 
-    private static function priced(string $productKey, Guard $guard, int $price, string $reason, ?string $checkoutUrl): Quote
+    private static function priced(string $productKey, Guard $guard, int $price, string $reason, ?string $checkoutUrl, ?string $country): Quote
     {
-        return new Quote($productKey, $price, $guard->currency, false, $reason, null, null, null, [], [], $checkoutUrl, false);
+        return new Quote($productKey, $price, $guard->currency, false, $reason, null, null, null, [], [], $checkoutUrl, false, $country, false);
+    }
+
+    private static function regional(string $productKey, Region $region, ?string $country): Quote
+    {
+        return new Quote($productKey, $region->price, $region->currency, false, Quote::REASON_BASE_PRICE, null, null, null, [], [], null, false, $country, true);
     }
 
     private static function userIdOf(mixed $id): ?string
@@ -1481,12 +1528,7 @@ final class Leverprice
             if ($fallback === null || $fallback <= 0) {
                 throw new \InvalidArgumentException($where . '.fallbackPrice must be a positive integer (minor units)');
             }
-            $min = isset($guard['minPrice']) ? Util::safeInt($guard['minPrice']) : 1;
-            $max = isset($guard['maxPrice']) ? Util::safeInt($guard['maxPrice']) : Util::MAX_SAFE_INTEGER;
-            if ($min === null || $max === null || $min > $max) {
-                throw new \InvalidArgumentException($where . ': minPrice and maxPrice must be integers with minPrice <= maxPrice');
-            }
-            $guards[(string) $key] = new Guard(strtolower($currency), $fallback, $min, $max);
+            $guards[(string) $key] = new Guard(strtolower($currency), $fallback);
         }
 
         return $guards;

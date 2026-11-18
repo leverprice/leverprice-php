@@ -19,7 +19,8 @@ use PHPUnit\Framework\Attributes\DataProvider;
 
 final class ClientTest extends TestCase
 {
-    private const PRODUCTS = ['pro' => ['currency' => 'USD', 'fallbackPrice' => 1900, 'minPrice' => 1500, 'maxPrice' => 3900]];
+    private const PRODUCTS = ['pro' => ['currency' => 'USD', 'fallbackPrice' => 1900]];
+    private const GUARD = ['currency' => 'usd', 'fallbackPrice' => 2900];
     private const BROWSER = ['user-agent' => self::UA];
 
     protected function tearDown(): void
@@ -140,7 +141,6 @@ final class ClientTest extends TestCase
             ['products' => ['pro' => ['currency' => 'usd', 'fallbackPrice' => 0]]],
             ['products' => ['pro' => ['currency' => 'usd', 'fallbackPrice' => 19.5]]],
             ['products' => ['pro' => ['currency' => 'dollars', 'fallbackPrice' => 1900]]],
-            ['products' => ['pro' => ['currency' => 'usd', 'fallbackPrice' => 1900, 'minPrice' => 10, 'maxPrice' => 5]]],
             ['products' => self::PRODUCTS, 'cookieName' => 'bad name;'],
             ['products' => self::PRODUCTS, 'secretkey' => self::SECRET_KEY],
             ['products' => self::PRODUCTS, 'timeoutMs' => -1],
@@ -152,6 +152,168 @@ final class ClientTest extends TestCase
             } catch (\InvalidArgumentException $e) {
                 self::assertStringStartsWith('Leverprice', $e->getMessage());
             }
+        }
+    }
+
+    /** @return iterable<string, array{array<string, mixed>}> */
+    public static function legacyPriceLimits(): iterable
+    {
+        yield 'narrower than the signed prices' => [['minPrice' => 2500, 'maxPrice' => 2600]];
+        yield 'minPrice above maxPrice' => [['minPrice' => 5000, 'maxPrice' => 100]];
+        yield 'strings' => [['minPrice' => '19.00', 'maxPrice' => 'forty-nine']];
+        yield 'other values' => [['minPrice' => -19.5, 'maxPrice' => true]];
+    }
+
+    /** @param array<string, mixed> $limits */
+    #[DataProvider('legacyPriceLimits')]
+    public function testMinPriceAndMaxPriceFrom03ConstructAndServeTheSignedPrices(array $limits): void
+    {
+        $products = array_map(static fn(array $guard): array => $guard + $limits, self::defaultGuards());
+        [$client] = $this->vectorClient(new FakeClock(self::vectorNow()), null, ['products' => $products, 'localCurrencies' => true]);
+
+        $quotes = [
+            $client->getPrice('basic', ['request' => self::BROWSER]),
+            $client->getPrice('pro', ['request' => self::BROWSER, 'userId' => 'user_42']),
+            $client->getPrice('pro', ['request' => self::BROWSER, 'bot' => true]),
+            $client->getPrice('wild', ['request' => self::BROWSER]),
+            $client->getPrice('geo', ['request' => self::BROWSER, 'country' => 'BR']),
+            $client->getPrice('geo', ['request' => self::BROWSER, 'country' => 'IN']),
+            $client->getPrice('geox', ['request' => self::BROWSER, 'country' => 'IN', 'userId' => 'user_42']),
+        ];
+        self::assertSame(
+            [
+                [Quote::REASON_BASE_PRICE, 900, 'usd', false],
+                [Quote::REASON_EXPERIMENT, 2900, 'usd', false],
+                [Quote::REASON_BOT, 2400, 'usd', false],
+                [Quote::REASON_OUT_OF_BOUNDS, 2000, 'usd', false],
+                [Quote::REASON_BASE_PRICE, 2000, 'usd', true],
+                [Quote::REASON_BASE_PRICE, 99900, 'inr', true],
+                [Quote::REASON_EXPERIMENT, 129900, 'inr', true],
+            ],
+            array_map(static fn(Quote $q): array => [$q->reason, $q->price, $q->currency, $q->regional], $quotes),
+        );
+        self::assertSame([], $this->reported());
+    }
+
+    public function testRejectsInvalidCountryHeader(): void
+    {
+        $cases = [
+            ['products' => self::PRODUCTS, 'countryHeader' => 'cf ipcountry'],
+            ['products' => self::PRODUCTS, 'countryHeader' => 'cf-ipcountry:'],
+            ['products' => self::PRODUCTS, 'countryHeader' => ['cf-ipcountry']],
+            ['products' => self::PRODUCTS, 'countryHeader' => "\u{212A}ey"],
+            ['products' => self::PRODUCTS, 'countryHeader' => "\u{00A0}cf-ipcountry"],
+            ['products' => self::PRODUCTS, 'countryHeader' => "cf-ipcountry\u{2003}"],
+        ];
+        foreach ($cases as $options) {
+            try {
+                new Leverprice($options + ['secretKey' => self::SECRET_KEY]);
+                self::fail('accepted ' . json_encode($options, JSON_THROW_ON_ERROR));
+            } catch (\InvalidArgumentException $e) {
+                self::assertStringStartsWith('Leverprice', $e->getMessage());
+            }
+        }
+    }
+
+    public function testCountryHeaderIsNormalized(): void
+    {
+        $guard = ['currency' => 'USD', 'fallbackPrice' => 2900];
+        $request = self::BROWSER + ['Cf-Ipcountry' => 'in'];
+
+        [$client] = $this->vectorClient(new FakeClock(self::vectorNow()), null, [
+            'products' => ['geo' => $guard],
+            'countryHeader' => " CF-IPCountry\n",
+            'localCurrencies' => true,
+        ]);
+        $quote = $client->getPrice('geo', ['request' => $request]);
+        self::assertSame([99900, 'inr', 'IN', true, null], [$quote->price, $quote->currency, $quote->country, $quote->regional, $quote->checkoutUrl]);
+
+        [$client] = $this->vectorClient(new FakeClock(self::vectorNow()), null, [
+            'products' => ['geo' => $guard],
+            'countryHeader' => ' ',
+            'localCurrencies' => true,
+        ]);
+        $quote = $client->getPrice('geo', ['request' => $request]);
+        self::assertSame([2900, 'usd', null, false], [$quote->price, $quote->currency, $quote->country, $quote->regional]);
+        self::assertSame([], $this->reported());
+    }
+
+    public function testLocalCurrenciesDecidesWhetherARegionInAnotherCurrencyIsServed(): void
+    {
+        $guard = ['currency' => 'usd', 'fallbackPrice' => 2900];
+        $cases = [[[], false], [['localCurrencies' => false], false], [['localCurrencies' => 1], false], [['localCurrencies' => true], true]];
+        foreach ($cases as [$options, $local]) {
+            [$client] = $this->vectorClient(new FakeClock(self::vectorNow()), null, $options + ['products' => ['geo' => $guard, 'geox' => $guard]]);
+            $quotes = [];
+            foreach (['IN', 'BR'] as $country) {
+                $quotes[] = $client->getPrice('geo', ['request' => self::BROWSER, 'country' => $country]);
+                $quotes[] = $client->getPrice('geox', ['request' => self::BROWSER, 'country' => $country, 'userId' => 'user_42']);
+            }
+            self::assertSame(
+                [
+                    $local ? [99900, 'inr', true] : [2900, 'usd', false],
+                    $local ? [129900, 'inr', true] : [3900, 'usd', false],
+                    [2000, 'usd', true],
+                    [2700, 'usd', true],
+                ],
+                array_map(static fn(Quote $q): array => [$q->price, $q->currency, $q->regional], $quotes),
+                self::envelope($options),
+            );
+        }
+        self::assertSame([], $this->reported());
+    }
+
+    public function testScopedTestLeavesTheCookieAloneOutsideItsScope(): void
+    {
+        [$client, $transport] = $this->vectorClient(new FakeClock(self::vectorNow()), null, ['products' => ['local' => self::GUARD]]);
+        $inside = $client->getPrice('local', ['request' => self::BROWSER, 'country' => 'CA', 'exposure' => 'manual']);
+        self::assertSame(Quote::REASON_EXPERIMENT, $inside->reason);
+        $request = self::BROWSER + ['cookie' => explode(';', $inside->setCookie[0])[0]];
+
+        foreach ([['US', 2900], ['MX', 2000], [null, 2900]] as [$country, $price]) {
+            $outside = $client->getPrice('local', ['request' => $request, 'country' => $country]);
+            self::assertSame(
+                [Quote::REASON_BASE_PRICE, $price, null, [], false],
+                [$outside->reason, $outside->price, $outside->visitorId, $outside->setCookie, $outside->exposureLogged],
+            );
+        }
+        $back = $client->getPrice('local', ['request' => $request, 'country' => 'CA', 'exposure' => 'manual']);
+        self::assertSame([$inside->variantId, []], [$back->variantId, $back->setCookie]);
+        $client->flush();
+        self::assertSame([], $transport->eventRequests());
+    }
+
+    public function testSplitReplacesTheVariantWeights(): void
+    {
+        [$client] = $this->vectorClient(new FakeClock(self::vectorNow()), null, ['products' => ['split' => self::GUARD]]);
+        $variants = static function (?string $country) use ($client): array {
+            $seen = [];
+            foreach (range(1, 40) as $user) {
+                $seen[] = $client->getPrice('split', ['request' => self::BROWSER, 'userId' => $user, 'country' => $country])->variantId;
+            }
+            $seen = array_unique($seen);
+            sort($seen);
+
+            return $seen;
+        };
+
+        self::assertSame(['var_s3'], $variants('IN'));
+        self::assertSame(['var_s2'], $variants('DE'));
+        self::assertSame(['var_s1'], $variants('FR'));
+        self::assertSame(['var_s1', 'var_s2'], $variants('US'));
+        self::assertSame(['var_s1', 'var_s2'], $variants(null));
+    }
+
+    public function testStickyAssignmentBeatsASplit(): void
+    {
+        [$client] = $this->vectorClient(new FakeClock(self::vectorNow()), null, ['products' => ['split' => self::GUARD]]);
+        $first = $client->getPrice('split', ['request' => self::BROWSER, 'country' => 'DE']);
+        self::assertSame('var_s2', $first->variantId);
+        $request = self::BROWSER + ['cookie' => explode(';', $first->setCookie[0])[0]];
+
+        foreach (['IN', 'FR', 'US', null] as $country) {
+            $again = $client->getPrice('split', ['request' => $request, 'country' => $country]);
+            self::assertSame(['var_s2', []], [$again->variantId, $again->setCookie]);
         }
     }
 
@@ -171,7 +333,7 @@ final class ClientTest extends TestCase
             self::assertSame(32, strlen(Util::b64urlDecode($key)));
         }
         self::assertSame(1, Leverprice::MIN_KEYSET_VERSION);
-        self::assertSame('0.3.0', Leverprice::SDK_VERSION);
+        self::assertSame('0.4.0', Leverprice::SDK_VERSION);
     }
 
     public function testColdStartThatTimesOutReturnsNoConfigWithinTimeout(): void
@@ -355,12 +517,12 @@ final class ClientTest extends TestCase
 
         $request = $transport->eventRequests()[0];
         self::assertSame('Bearer ' . self::SECRET_KEY, $request->headers['Authorization']);
-        self::assertSame('leverprice-sdk-php/0.3.0', $request->headers['User-Agent']);
+        self::assertSame('leverprice-sdk-php/0.4.0', $request->headers['User-Agent']);
         self::assertSame('application/json', $request->headers['Content-Type']);
         self::assertArrayNotHasKey('Origin', $request->headers);
         self::assertSame('https://api.leverprice.com/v1/events', $request->url);
         $body = self::arr(json_decode((string) $request->body, true, 512, JSON_THROW_ON_ERROR));
-        self::assertSame(['name' => 'leverprice-php', 'version' => '0.3.0'], $body['sdk']);
+        self::assertSame(['name' => 'leverprice-php', 'version' => '0.4.0'], $body['sdk']);
         self::assertSame([[
             'type' => 'purchase',
             'provider' => 'stripe',
@@ -472,6 +634,57 @@ final class ClientTest extends TestCase
         self::assertCount(1, $events);
         self::assertSame($quote->visitorId, $events[0]['visitorId']);
         self::assertFalse($client->logExposure($client->getPrice('basic', ['request' => self::BROWSER])));
+    }
+
+    public function testManualExposureNeverSendsWhatIsNotACountry(): void
+    {
+        [$client, $transport] = $this->vectorClient(new FakeClock(self::vectorNow()));
+        $sent = [];
+        foreach ([' br ', "\u{00DF}", "\u{0131}n", 'USA', "US\0", null] as $country) {
+            $quote = $client->getPrice('geox', ['request' => self::BROWSER, 'exposure' => 'manual']);
+            $edited = new Quote(
+                $quote->productKey,
+                $quote->price,
+                $quote->currency,
+                $quote->isFallback,
+                $quote->reason,
+                $quote->experimentId,
+                $quote->variantId,
+                $quote->visitorId,
+                $quote->metadata,
+                $quote->setCookie,
+                $quote->checkoutUrl,
+                false,
+                $country,
+            );
+            self::assertTrue($client->logExposure($edited));
+            $client->flush();
+            $events = $transport->sentEvents();
+            $sent[] = end($events)['country'] ?? null;
+        }
+        self::assertSame(['BR', null, null, null, null, null], $sent);
+        self::assertSame([], $this->reported());
+    }
+
+    public function testManualExposureSendsTheQuoteCountry(): void
+    {
+        [$client, $transport] = $this->vectorClient(new FakeClock(self::vectorNow()), null, ['countryHeader' => 'cf-ipcountry', 'localCurrencies' => true]);
+        $quote = $client->getPrice('geox', ['request' => self::BROWSER + ['cf-ipcountry' => 'IN'], 'exposure' => 'manual']);
+        self::assertSame(['IN', true, false], [$quote->country, $quote->regional, $quote->exposureLogged]);
+        $client->flush();
+        self::assertSame([], $transport->eventRequests());
+
+        self::assertTrue($client->logExposure($quote));
+        $unknown = $client->getPrice('geox', ['request' => self::BROWSER, 'exposure' => 'manual']);
+        self::assertNull($unknown->country);
+        self::assertTrue($client->logExposure($unknown));
+        $client->flush();
+
+        $events = $transport->sentEvents();
+        self::assertCount(2, $events);
+        self::assertSame([$quote->visitorId, 'IN'], [$events[0]['visitorId'], $events[0]['country'] ?? null]);
+        self::assertSame($unknown->visitorId, $events[1]['visitorId']);
+        self::assertArrayNotHasKey('country', $events[1]);
     }
 
     public function testExposuresFlushAtTerminate(): void

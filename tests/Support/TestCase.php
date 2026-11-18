@@ -17,17 +17,27 @@ abstract class TestCase extends \PHPUnit\Framework\TestCase
     /** @var list<string> */
     protected array $errors = [];
 
-    /** @return array<string, array<string, int|string>> */
+    /** @return array<string, array<string, mixed>> */
     protected static function defaultGuards(): array
     {
         return [
-            'pro' => ['currency' => 'usd', 'fallbackPrice' => 1900, 'minPrice' => 1500, 'maxPrice' => 3900],
+            'pro' => ['currency' => 'usd', 'fallbackPrice' => 1900],
             'basic' => ['currency' => 'usd', 'fallbackPrice' => 1000],
-            'euro' => ['currency' => 'eur', 'fallbackPrice' => 1200, 'minPrice' => 100, 'maxPrice' => 5000],
-            'wild' => ['currency' => 'usd', 'fallbackPrice' => 2000, 'minPrice' => 1000, 'maxPrice' => 3000],
+            'euro' => ['currency' => 'eur', 'fallbackPrice' => 1200],
+            'wild' => ['currency' => 'usd', 'fallbackPrice' => 2000],
             'bad' => ['currency' => 'usd', 'fallbackPrice' => 150],
             'ghost' => ['currency' => 'usd', 'fallbackPrice' => 4900],
+            'geo' => ['currency' => 'usd', 'fallbackPrice' => 2900],
+            'geox' => ['currency' => 'usd', 'fallbackPrice' => 2900],
+            'badgeo' => ['currency' => 'usd', 'fallbackPrice' => 2900],
+            'badgeox' => ['currency' => 'usd', 'fallbackPrice' => 2900],
         ];
+    }
+
+    /** @return list<string> */
+    protected function reported(): array
+    {
+        return array_values(array_filter($this->errors, static fn(string $e): bool => !str_contains($e, 'malformed products')));
     }
 
     /**

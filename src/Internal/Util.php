@@ -9,6 +9,7 @@ final class Util
 {
     public const MAX_SAFE_INTEGER = 9007199254740991;
     public const ID_RE = '/^[A-Za-z0-9_-]{1,64}$/D';
+    public const COUNTRY_RE = '/\A[A-Z]{2}\z/';
     private const JS_SPACE = '\s\x{00A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}';
     private const JSON_FLAGS = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR;
 
@@ -94,6 +95,11 @@ final class Util
     public static function isId(mixed $v): bool
     {
         return is_string($v) && preg_match(self::ID_RE, $v) === 1;
+    }
+
+    public static function isCountry(mixed $v): bool
+    {
+        return is_string($v) && preg_match(self::COUNTRY_RE, $v) === 1;
     }
 
     public static function trim(string $s): string

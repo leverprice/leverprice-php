@@ -7,10 +7,12 @@ namespace Leverprice\Internal;
 /** @internal */
 final class RequestReader
 {
-    private const PREFETCH_HEADERS = ['sec-purpose', 'purpose', 'x-purpose', 'x-moz'];
+    private const PREFETCH_HEADERS = ['sec-purpose', 'x-sec-purpose', 'purpose', 'x-purpose', 'x-moz'];
+    private const NOT_A_COUNTRY = ['XX', 'ZZ', 'T1', 'A1', 'A2', 'AP', 'EU'];
+    private const COUNTRY_INPUT_RE = '/\A[ \t\n\x0B\f\r]*([A-Za-z]{2})[ \t\n\x0B\f\r]*\z/';
 
     /** @param array<array-key, mixed> $context */
-    public static function read(array $context, string $cookieName): RequestInfo
+    public static function read(array $context, string $cookieName, ?string $countryHeader = null): RequestInfo
     {
         $request = $context['request'] ?? null;
         $source = $request ?? Superglobals::instance();
@@ -27,8 +29,34 @@ final class RequestReader
         $userAgent = isset($context['userAgent']) && is_string($context['userAgent'])
             ? $context['userAgent']
             : self::header($source, 'user-agent');
+        $country = isset($context['country']) && is_string($context['country'])
+            ? $context['country']
+            : ($countryHeader === null ? null : self::header($source, $countryHeader));
 
-        return new RequestInfo($cookieInput, $assignmentCookies, $pinned, $userAgent, self::isPrefetch($source));
+        return new RequestInfo(
+            $cookieInput,
+            $assignmentCookies,
+            $pinned,
+            $userAgent,
+            self::isPrefetch($source),
+            self::normalizeCountry($country),
+        );
+    }
+
+    /** @param array<array-key, mixed> $context */
+    public static function headerCountry(array $context, string $header): ?string
+    {
+        return self::normalizeCountry(self::header($context['request'] ?? Superglobals::instance(), $header));
+    }
+
+    public static function normalizeCountry(mixed $value): ?string
+    {
+        if (!is_string($value) || preg_match(self::COUNTRY_INPUT_RE, $value, $match) !== 1) {
+            return null;
+        }
+        $code = strtr($match[1], 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ');
+
+        return in_array($code, self::NOT_A_COUNTRY, true) ? null : $code;
     }
 
     public static function header(mixed $request, string $name): ?string

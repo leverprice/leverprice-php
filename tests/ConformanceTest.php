@@ -171,6 +171,14 @@ final class ConformanceTest extends TestCase
         }
     }
 
+    public function testNormalizesCountries(): void
+    {
+        foreach (self::arr(Vectors::arrays()['countries']) as $case) {
+            $case = self::arr($case);
+            self::assertSame($case['country'], RequestReader::normalizeCountry($case['value']), self::envelope($case['value']));
+        }
+    }
+
     public function testDetectsBots(): void
     {
         foreach (self::arr(Vectors::arrays()['bots']) as $case) {
@@ -204,19 +212,24 @@ final class ConformanceTest extends TestCase
     {
         $products = self::defaultGuards();
         foreach (self::arr($case['guards'] ?? []) as $key => $guard) {
-            /** @var array<string, int|string> $guard */
+            /** @var array<string, mixed> $guard */
             $products[(string) $key] = $guard;
         }
-        [$client, $transport] = $this->vectorClient(new FakeClock(self::vectorNow()), null, ['products' => $products]);
+        $options = ['products' => $products];
+        foreach (['countryHeader', 'localCurrencies'] as $key) {
+            if (isset($case[$key])) {
+                $options[$key] = $case[$key];
+            }
+        }
+        [$client, $transport] = $this->vectorClient(new FakeClock(self::vectorNow()), null, $options);
 
         $context = ['request' => self::arr($case['headers']), 'userId' => $case['userId']];
-        if (isset($case['exposure'])) {
-            $context['exposure'] = $case['exposure'];
+        foreach (['exposure', 'bot', 'country'] as $key) {
+            if (isset($case[$key])) {
+                $context[$key] = $case[$key];
+            }
         }
-        if (isset($case['bot'])) {
-            $context['bot'] = $case['bot'];
-        }
-        /** @var array{request?: mixed, cookie?: ?string, userAgent?: ?string, userId?: string|int|null, exposure?: ?string, bot?: ?bool} $context */
+        /** @var array{request?: mixed, cookie?: ?string, userAgent?: ?string, userId?: string|int|null, country?: ?string, exposure?: ?string, bot?: ?bool} $context */
         $quote = $client->getPrice(self::str($case['productKey']), $context);
         $client->flush();
 
@@ -233,7 +246,7 @@ final class ConformanceTest extends TestCase
         ksort($expected);
 
         self::assertSame($expected, $actual);
-        self::assertSame([], array_values(array_filter($this->errors, static fn(string $e): bool => !str_contains($e, 'malformed products'))));
+        self::assertSame($case['errors'], $this->reported());
     }
 
     private static function assignmentKey(): string

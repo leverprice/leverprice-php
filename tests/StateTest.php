@@ -9,6 +9,7 @@ use Leverprice\Http\HttpResponse;
 use Leverprice\Http\TransportException;
 use Leverprice\Internal\Acceptor;
 use Leverprice\Internal\SharedState;
+use Leverprice\Internal\Util;
 use Leverprice\Leverprice;
 use Leverprice\Quote;
 use Leverprice\State\ApcuStore;
@@ -92,6 +93,88 @@ final class StateTest extends TestCase
         if (DIRECTORY_SEPARATOR === '/') {
             self::assertSame(0o600, fileperms($this->stateFile()) & 0o777);
         }
+    }
+
+    public function testRegionalPricesSurviveTheCacheBetweenRequests(): void
+    {
+        $clock = new FakeClock(self::vectorNow());
+        $options = ['cache' => new FileStore($this->directory), 'localCurrencies' => true];
+        [$first] = $this->vectorClient($clock, null, $options);
+        $first->getPrice('basic', ['request' => self::BROWSER]);
+
+        $clock->advance(1000);
+        [$second, $transport] = $this->vectorClient($clock, self::down(), $options);
+        $quote = $second->getPrice('geo', ['request' => self::BROWSER, 'country' => 'IN']);
+        self::assertSame([99900, 'inr', 'IN', true], [$quote->price, $quote->currency, $quote->country, $quote->regional]);
+        $variant = $second->getPrice('geox', ['request' => self::BROWSER, 'country' => 'BR', 'userId' => 'user_42']);
+        self::assertSame([2700, 'usd', 'BR', true], [$variant->price, $variant->currency, $variant->country, $variant->regional]);
+        self::assertSame([], $transport->requests);
+    }
+
+    public function testTheProjectCountryHeaderSurvivesTheCacheBetweenRequests(): void
+    {
+        foreach ([new FileStore($this->directory), new Psr16Store(new ArrayCache())] as $store) {
+            $clock = new FakeClock(self::vectorNow());
+            [$first] = $this->process($clock, null, $store);
+            $first->getPrice('basic', ['request' => self::BROWSER]);
+
+            $clock->advance(1000);
+            [$second, $transport] = $this->process($clock, self::down(), $store);
+            $quote = $second->getPrice('geo', ['request' => self::BROWSER + ['X-Geo-Country' => 'br']]);
+            self::assertSame([2000, 'usd', 'BR', true], [$quote->price, $quote->currency, $quote->country, $quote->regional]);
+            self::assertSame([], $transport->requests);
+        }
+    }
+
+    public function testTestsByCountrySurviveTheCacheBetweenRequests(): void
+    {
+        $guard = ['currency' => 'usd', 'fallbackPrice' => 2900];
+        foreach ([new FileStore($this->directory), new Psr16Store(new ArrayCache())] as $store) {
+            $clock = new FakeClock(self::vectorNow());
+            $options = ['cache' => $store, 'products' => ['local' => $guard, 'split' => $guard]];
+            [$first] = $this->vectorClient($clock, null, $options);
+            $first->getPrice('split', ['request' => self::BROWSER]);
+
+            $clock->advance(1000);
+            [$second, $transport] = $this->vectorClient($clock, self::down(), $options);
+            self::assertSame('var_s3', $second->getPrice('split', ['request' => self::BROWSER, 'country' => 'IN'])->variantId);
+            self::assertSame(Quote::REASON_EXPERIMENT, $second->getPrice('local', ['request' => self::BROWSER, 'country' => 'CA'])->reason);
+            self::assertSame(Quote::REASON_BASE_PRICE, $second->getPrice('local', ['request' => self::BROWSER, 'country' => 'US'])->reason);
+            self::assertSame([], $transport->requests);
+        }
+    }
+
+    public function testCachedConfigWithoutRegionsStillLoads(): void
+    {
+        $legacy = null;
+        foreach (self::arr(Vectors::objects()->trust) as $case) {
+            self::assertInstanceOf(\stdClass::class, $case);
+            if (self::str($case->name) === 'config without malformed products drops nothing') {
+                $legacy = self::arr($case->steps)[0];
+            }
+        }
+        self::assertInstanceOf(\stdClass::class, $legacy);
+        self::assertInstanceOf(\stdClass::class, $legacy->envelope);
+        self::assertStringNotContainsString('"regions"', Util::b64urlDecode(self::str($legacy->envelope->payload)));
+
+        $clock = new FakeClock(self::vectorNow());
+        $state = new SharedState();
+        $state->envelope = self::envelope($legacy->envelope);
+        $state->etag = '"v5"';
+        $state->fetchedAt = $clock->now;
+        $state->configVersion = 5;
+        $macKey = hash_hmac('sha256', 'leverprice:state:v1', self::str(Vectors::arrays()['secretKey']), true);
+
+        $store = new FileStore($this->directory);
+        [$probe] = $this->process($clock, self::down(), $store);
+        $probe->getPrice('basic', ['request' => self::BROWSER]);
+        $key = basename($this->stateFile(), '.state');
+        self::assertTrue($store->write(substr($key, strlen('leverprice-')), $state->encode($macKey)));
+
+        [$client, $transport] = $this->process($clock, self::down(), $store);
+        $quote = $client->getPrice('basic', ['request' => self::BROWSER, 'country' => 'IN']);
+        self::assertSame([Quote::REASON_BASE_PRICE, 900, 'usd', 'IN', false], [$quote->reason, $quote->price, $quote->currency, $quote->country, $quote->regional]);
+        self::assertSame([], $transport->requests);
     }
 
     public function testTamperedStateFileIsIgnored(): void

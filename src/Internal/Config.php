@@ -18,6 +18,7 @@ final class Config
         public readonly int|float $expiresAt,
         public readonly string $assignmentKey,
         public readonly array $keyFingerprints,
+        public readonly ?string $countryHeader,
         private readonly array $products,
     ) {}
 

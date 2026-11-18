@@ -34,6 +34,8 @@ final class Quote implements \JsonSerializable
         public readonly array $setCookie,
         public readonly ?string $checkoutUrl,
         public bool $exposureLogged,
+        public readonly ?string $country = null,
+        public readonly bool $regional = false,
     ) {}
 
     /** Sends `setCookie` with header(); false when headers were already sent. */
@@ -79,9 +81,9 @@ final class Quote implements \JsonSerializable
     }
 
     /**
-     * @return array{productKey: string, price: int, currency: string, isFallback: bool, reason: string,
-     *     experimentId: ?string, variantId: ?string, visitorId: ?string, metadata: array<string, string>,
-     *     setCookie: list<string>, checkoutUrl: ?string, exposureLogged: bool}
+     * @return array{productKey: string, price: int, currency: string, country: ?string, regional: bool,
+     *     isFallback: bool, reason: string, experimentId: ?string, variantId: ?string, visitorId: ?string,
+     *     metadata: array<string, string>, setCookie: list<string>, checkoutUrl: ?string, exposureLogged: bool}
      */
     public function toArray(): array
     {
@@ -89,6 +91,8 @@ final class Quote implements \JsonSerializable
             'productKey' => $this->productKey,
             'price' => $this->price,
             'currency' => $this->currency,
+            'country' => $this->country,
+            'regional' => $this->regional,
             'isFallback' => $this->isFallback,
             'reason' => $this->reason,
             'experimentId' => $this->experimentId,

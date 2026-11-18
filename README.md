@@ -29,8 +29,7 @@ use Leverprice\Leverprice;
 $leverprice = new Leverprice([
     'secretKey' => getenv('LEVERPRICE_SECRET_KEY'), // server-only
     'products' => [
-        // Local guardrails: prices outside these bounds are never returned.
-        'pro' => ['currency' => 'usd', 'fallbackPrice' => 1900, 'minPrice' => 1500, 'maxPrice' => 3900],
+        'pro' => ['currency' => 'usd', 'fallbackPrice' => 1900], // your current price, served whenever Leverprice cannot answer
     ],
 ]);
 
@@ -55,18 +54,29 @@ $session = $stripe->checkout->sessions->create([
 $q->applyCookies();
 
 // 3. In your webhook handler (or connect your provider's webhooks to Leverprice directly).
-$event = \Stripe\Webhook::constructEvent($payload, $_SERVER['HTTP_STRIPE_SIGNATURE'], $endpointSecret);
-if ($event->type === 'checkout.session.completed') {
-    $session = $event->data->object;
+//    A session paid with a delayed method completes 'unpaid'; async_payment_succeeded reports it later.
+$payload = file_get_contents('php://input'); // the raw body, exactly as received
+$event = \Stripe\Webhook::constructEvent($payload, $_SERVER['HTTP_STRIPE_SIGNATURE'] ?? '', $endpointSecret);
+$paid = ['checkout.session.completed', 'checkout.session.async_payment_succeeded'];
+$session = $event->data->object;
+if (in_array($event->type, $paid, true) && $session->payment_status === 'paid'
+    && isset($session->payment_intent) && $session->amount_total > 0) { // $0: a trial start, a 100% discount
     $leverprice->trackPurchase([
         'provider' => 'stripe',
         'orderId' => $session->payment_intent,
         'amount' => $session->amount_total - ($session->total_details->amount_tax ?? 0),
         'currency' => $session->currency,
         'metadata' => $session->metadata,
+        'timestamp' => $event->created, // Unix seconds are converted
     ]);
 }
 ```
+
+`constructEvent()` throws `\Stripe\Exception\SignatureVerificationException` for a bad signature and `\UnexpectedValueException` for a body that is not JSON; answer both with HTTP 400.
+
+A subscription session names the PaymentIntent of its first payment from Stripe API version 2025-03-31.basil on. On an older version, report that payment from `invoice.paid` with `billing_reason` `subscription_create`: the order id is the invoice's `payment_intent` and the attribution is in `subscription_details.metadata`, so pass `'subscription_data' => ['metadata' => $q->metadata]` at checkout as well.
+
+That is all the configuration your code holds. Prices, price ranges, tests, regional prices and where the visitor's country comes from are managed in Leverprice and arrive in a signed config, so new features and new settings never need a code change.
 
 ### Laravel
 
@@ -120,7 +130,7 @@ services:
             $options:
                 secretKey: '%env(LEVERPRICE_SECRET_KEY)%'
                 products:
-                    pro: { currency: usd, fallbackPrice: 1900, minPrice: 1500, maxPrice: 3900 }
+                    pro: { currency: usd, fallbackPrice: 1900 }
 ```
 
 ```php
@@ -148,7 +158,7 @@ foreach ($quote->setCookie as $cookie) {
 
 - **Fails safe.** If Leverprice is off, slow (no config within 500 ms), down, misconfigured or returns anything unexpected, `getPrice()` returns your `fallbackPrice`. It never throws for those reasons; only for a product key missing from `products`.
 - **Verified config.** Root key → keyset → config signature chain (Ed25519), version-monotonic (no rollback, no revoked keys), time-limited.
-- **Bounded.** Every price is checked against your local `minPrice`/`maxPrice` and `currency`.
+- **Bounded.** Every standard and test price is checked against the product's signed price range and currency; regional prices follow from them, and every country pays between 5% and 200% of the standard price.
 - **Sticky and tamper-proof.** Visitors keep their price. The assignment cookie is HMAC-signed with your project's assignment key, so rotating your API key does not reshuffle visitors.
 - **Private.** Visitor and user ids are HMAC-hashed on your server; Leverprice only sees the hash.
 - **No price flips.** A visitor who got the fallback during an outage keeps it for the rest of their session.
@@ -163,9 +173,27 @@ foreach ($quote->setCookie as $cookie) {
 
 Pricing several products on one page? Pass the same request object to each `getPrice()` call (or no request at all): the quotes share one visitor cookie, and the last quote's cookie carries every assignment.
 
+## Regional prices
+
+Turn on regional prices for a product in the dashboard and a visitor from India pays $12, or ₹999 in rupees, where a visitor from the US pays $29. Your code stays as it is: in Leverprice, choose where your site runs under **Project settings → Visitor country** (Cloudflare, Vercel, AWS CloudFront, or the header your own proxy sets), and the SDK reads the visitor's country from that header.
+
+```php
+$quote = $leverprice->getPrice('pro', ['request' => $request]); // a visitor from India
+$quote->price;    // 1200: India is set to $12 in the dashboard
+$quote->currency; // 'usd': pass both to your checkout
+$quote->country;  // 'IN'
+$quote->regional; // true
+```
+
+- **The country.** The header is read from the request you pass, or from `$_SERVER` without one. Name only a header your host or CDN sets and overwrites: a header a visitor can send themselves would let them pick their own price. In `$_SERVER`, `CF_IPCountry` and `CF-IPCountry` are the same key, so keep header names with underscores dropped in front of PHP (the nginx default). To decide in code instead, pass `'countryHeader'` to the constructor (it replaces the project setting) or `'country'` to `getPrice()` (it wins over both).
+- **Local currencies.** Regional prices in your product's currency ($12 in India instead of $29) need nothing in code. Prices in the visitor's own currency (₹999) are served only with `'localCurrencies' => true`, which you set when your checkout charges `$quote->price` in `$quote->currency`; without it those visitors get the standard price, so a checkout with a fixed currency can never charge 99900 in dollars.
+- **Tests.** Each visitor still gets one sticky variant, at that variant's price for their country. A test can run in selected countries only, and countries can get their own share of traffic per price: both are set in the dashboard and need nothing from your code but the visitor's country.
+- **Checkout.** Always pass `$quote->currency` with `$quote->price`, also before you turn regional prices on: then they need no code change later. `checkoutUrl` is `null` for a regional price: hosted checkout links are made for standard prices.
+- Bots and visitors whose country is unknown get the standard price.
+
 ## Exposures
 
-An exposure is one person seeing an experiment price. With `'exposure' => 'auto'` (default) the SDK logs it the first time a visitor gets a price from an experiment, once per visitor and experiment (remembered in the cookie; the server deduplicates too). Prefetch and prerender requests (`Sec-Purpose`, `Purpose`, `X-Moz`, `Next-Router-Prefetch`) are priced but not counted.
+An exposure is one person seeing an experiment price. With `'exposure' => 'auto'` (default) the SDK logs it the first time a visitor gets a price from an experiment, once per visitor and experiment (remembered in the cookie; the server deduplicates too). Prefetch and prerender requests (`Sec-Purpose`, `Purpose`, `X-Purpose`, `X-Moz`, `Next-Router-Prefetch`, and Turbo's `X-Sec-Purpose`) are priced but not counted.
 
 If you compute the price before it is visible (a hidden tab, a modal), use manual mode:
 
@@ -214,38 +242,40 @@ When any Leverprice response announces a newer version in `Leverprice-Config-Ver
 
 ## Reference
 
-`getPrice(string $productKey, array $context = []): Quote` — context keys: `request`, `cookie`, `userAgent`, `userId` (string, int or `Stringable`), `exposure` (`'auto'` / `'manual'`), `bot`. Throws `InvalidArgumentException` only if `$productKey` is missing from `products`.
+`getPrice(string $productKey, array $context = []): Quote` — context keys: `request`, `cookie`, `userAgent`, `userId` (string, int or `Stringable`), `exposure` (`'auto'` / `'manual'`), `bot`, `country`. Throws `InvalidArgumentException` only if `$productKey` is missing from `products`.
 
 | `Quote` property | |
 |---|---|
 | `productKey` | The key you asked for |
 | `price` | Minor units; use it for display and as the checkout amount |
-| `currency` | Lowercase ISO 4217, from your product guard |
+| `currency` | Lowercase ISO 4217: your product's currency, or the region's for a regional price |
+| `country` | The visitor's country (ISO 3166-1 alpha-2) when known, else `null` |
+| `regional` | `true` when `price` is the regional price of `country` |
 | `isFallback` | `true` when `price` is your `fallbackPrice` |
 | `reason` | See below (`Quote::REASON_*` constants) |
 | `experimentId`, `variantId` | Set when `reason` is `experiment`, else `null` |
 | `visitorId` | Hashed visitor id Leverprice sees; `null` unless `reason` is `experiment` |
 | `metadata` | `['pp_exp', 'pp_var', 'pp_vid', 'pp_sig']` for the checkout (signed); `[]` otherwise |
 | `setCookie` | `Set-Cookie` values to send (zero or more) |
-| `checkoutUrl` | No-code mode: hosted checkout link for this price, or `null` |
+| `checkoutUrl` | No-code mode: hosted checkout link for this price, or `null` (always `null` for a regional price) |
 | `exposureLogged` | An exposure for this visitor and experiment has been logged (now or earlier) |
 
 | `reason` | Price |
 |---|---|
 | `experiment` | The visitor's sticky variant |
-| `base_price` | Standard price (no experiment running) |
+| `base_price` | The product's price for this visitor (no experiment runs for them) |
 | `bot` | Standard price, or fallback if unavailable; never enrolled |
 | `disabled` | Fallback: kill switch, no valid secret key, or no Ed25519 |
 | `no_config` | Fallback: no usable signed config (timeout, outage, rejected or expired); sets the pin |
 | `pinned_fallback` | Fallback: this browser got a fallback during an outage in this session |
 | `unknown_product` | Fallback: the config has no such product |
 | `currency_mismatch` | Fallback: the config's currency differs from your guard |
-| `out_of_bounds` | Fallback: a price is outside your (or Leverprice's) min/max |
+| `out_of_bounds` | Fallback: a price is outside the product's signed range |
 
 | Method | |
 |---|---|
 | `logExposure(Quote $quote): bool` | Logs a manual-mode exposure; `true` if one was queued |
-| `trackPurchase(['provider', 'orderId', 'amount', 'currency', 'metadata', 'timestamp'?])` | Reads `pp_exp`/`pp_var`/`pp_vid`/`pp_sig` from `metadata` (array, `ArrayAccess` or object). Providers: `stripe`, `polar`, `lemonsqueezy`, `dodo`, `other` |
+| `trackPurchase(['provider', 'orderId', 'amount', 'currency', 'metadata', 'timestamp'?])` | Reads `pp_exp`/`pp_var`/`pp_vid`/`pp_sig` from `metadata` (array, `ArrayAccess` or object). Providers: `stripe`, `polar`, `lemonsqueezy`, `dodo`, `paddle`, `creem`, `other` |
 | `trackRefund(['provider', 'orderId', 'currency', 'refundId', 'amount'] \| [… 'refundedTotal'])` | One refund by id, or the order's cumulative refunded total |
 | `flush()` | Sends queued events and the outbox now (≤ 500 per request; undelivered money events go to the outbox) |
 | `refresh()` / `preload()` | Fetch the config now / only if none is usable |
@@ -257,7 +287,7 @@ Timestamps are milliseconds since the epoch; Unix seconds and `DateTimeInterface
 | Option | Default | |
 |---|---|---|
 | `secretKey` | — | `pp_sk_live_…` / `pp_sk_test_…` |
-| `products` | — | `key => ['currency', 'fallbackPrice', 'minPrice'?, 'maxPrice'?]` |
+| `products` | — | `key => ['currency', 'fallbackPrice']`. `minPrice` and `maxPrice` are deprecated (ignored since 0.4: the price range is set in Leverprice) |
 | `disabled` | `false` | Kill switch |
 | `apiUrl` | `https://api.leverprice.com` | |
 | `timeoutMs` | `500` | Longest a request waits for a config when none is cached |
@@ -267,6 +297,8 @@ Timestamps are milliseconds since the epoch; Unix seconds and `DateTimeInterface
 | `cookieMaxAgeSeconds` | `15552000` | 180 days |
 | `cookieSecure` | `true` | Set `false` only for plain-HTTP development |
 | `cookieDomain` | none | |
+| `countryHeader` | none | Request header your CDN or host sets to the visitor's country; overrides **Project settings → Visitor country**, see [Regional prices](#regional-prices) |
+| `localCurrencies` | `false` | Serve regional prices in the visitor's currency, not only in each product's own; set it only when your checkout charges `$quote->price` in `$quote->currency` |
 | `flushIntervalMs` | `2000` | Longest exposures wait in a long-running worker |
 | `trustedRootKeys` | `ROOT_PUBLIC_KEYS` | For local development |
 | `cache` | APCu or temp file | See [Caching between requests](#caching-between-requests) |
@@ -277,6 +309,8 @@ Timestamps are milliseconds since the epoch; Unix seconds and `DateTimeInterface
 | `clock` | system clock | A `Leverprice\Clock` (tests) |
 | `finishRequest` | `true` | Call `fastcgi_finish_request()` before shutdown work |
 | `registerShutdown` | `true` | Run `terminate()` automatically at shutdown |
+
+**Upgrading from 0.3:** no code changes. `minPrice` and `maxPrice` in your code are no longer used: the product's range set in Leverprice applies, and you can delete them whenever you like. If the limits in your code were tighter than that range, tighten the range in Leverprice before you upgrade. Regional prices need no code: turn them on in the dashboard and set **Project settings → Visitor country**. Add `'localCurrencies' => true` if your checkout passes `$quote->currency` and you want prices in visitors' own currencies.
 
 ## License
 

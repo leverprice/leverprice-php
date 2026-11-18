@@ -190,7 +190,7 @@ final class TransportTest extends TestCase
         $lp->trackPurchase(['provider' => 'stripe', 'orderId' => 'pi_1', 'amount' => 1, 'currency' => 'usd']);
         $last = end($client->requests);
         self::assertInstanceOf(RequestInterface::class, $last);
-        self::assertSame('leverprice-sdk-php/0.3.0', $last->getHeaderLine('User-Agent'));
+        self::assertSame('leverprice-sdk-php/0.4.0', $last->getHeaderLine('User-Agent'));
     }
 
     public function testHttpResponseHeaders(): void

@@ -7,6 +7,7 @@ namespace Leverprice\Internal;
 /** @internal */
 final class Product
 {
+    /** @param array<string, Region> $regionOf */
     public function __construct(
         public readonly string $id,
         public readonly string $currency,
@@ -14,6 +15,22 @@ final class Product
         public readonly int $minPrice,
         public readonly int $maxPrice,
         public readonly ?string $checkoutUrl,
-        public readonly ?Experiment $experiment,
+        private readonly ?Experiment $experiment,
+        private readonly array $regionOf,
     ) {}
+
+    public function inRange(int $price): bool
+    {
+        return $price > 0 && $price >= $this->minPrice && $price <= $this->maxPrice;
+    }
+
+    public function experimentFor(?string $country): ?Experiment
+    {
+        return $this->experiment !== null && $this->experiment->runsIn($country) ? $this->experiment : null;
+    }
+
+    public function region(string $country): ?Region
+    {
+        return $this->regionOf[$country] ?? null;
+    }
 }

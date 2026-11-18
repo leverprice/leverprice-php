@@ -14,5 +14,11 @@ final class RequestInfo
         public readonly bool $pinned,
         public readonly ?string $userAgent,
         public readonly bool $prefetch,
+        public readonly ?string $country,
     ) {}
+
+    public function withCountry(?string $country): self
+    {
+        return new self($this->cookieInput, $this->assignmentCookies, $this->pinned, $this->userAgent, $this->prefetch, $country);
+    }
 }

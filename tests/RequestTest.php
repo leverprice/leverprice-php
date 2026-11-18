@@ -52,6 +52,18 @@ final class RequestTest extends TestCase
         self::assertTrue($info->prefetch);
     }
 
+    public function testReadsTurboHoverPrefetch(): void
+    {
+        $request = SymfonyRequest::create('https://shop.test/pricing', 'GET', [], [], [], [
+            'HTTP_USER_AGENT' => self::UA,
+            'HTTP_X_SEC_PURPOSE' => 'prefetch',
+        ]);
+        self::assertTrue(RequestReader::read(['request' => $request], '__pp')->prefetch);
+
+        $_SERVER['HTTP_X_SEC_PURPOSE'] = 'prefetch';
+        self::assertTrue(RequestReader::read([], '__pp')->prefetch);
+    }
+
     public function testReadsPsr7Requests(): void
     {
         $request = (new ServerRequest('GET', 'https://shop.test/'))
@@ -101,6 +113,66 @@ final class RequestTest extends TestCase
         $legacy = RequestReader::read(['request' => [], 'cookie' => ' body.sig '], '__pp');
         self::assertSame(['body.sig'], $legacy->assignmentCookies);
         self::assertFalse($legacy->pinned);
+    }
+
+    public function testReadsTheCountryOnlyFromTheHeaderItIsToldToTrust(): void
+    {
+        $request = ['cf-ipcountry' => 'br', 'x-vercel-ip-country' => 'IN'];
+        self::assertNull(RequestReader::read(['request' => $request], '__pp')->country);
+        self::assertSame('BR', RequestReader::read(['request' => $request], '__pp', 'cf-ipcountry')->country);
+        self::assertSame('IN', RequestReader::read(['request' => $request], '__pp', 'x-vercel-ip-country')->country);
+        self::assertSame('DE', RequestReader::read(['request' => $request, 'country' => 'de'], '__pp', 'cf-ipcountry')->country);
+        self::assertNull(RequestReader::read(['request' => $request, 'country' => 'nowhere'], '__pp', 'cf-ipcountry')->country);
+        self::assertSame('BR', RequestReader::read(['request' => $request, 'country' => null], '__pp', 'cf-ipcountry')->country);
+        self::assertNull(RequestReader::read(['request' => ['cf-ipcountry' => 'XX']], '__pp', 'cf-ipcountry')->country);
+        self::assertNull(RequestReader::read(['request' => ['cf-ipcountry' => ['BR', 'IN']]], '__pp', 'cf-ipcountry')->country);
+
+        $symfony = SymfonyRequest::create('https://shop.test/pricing', 'GET', [], [], [], ['HTTP_CF_IPCOUNTRY' => 'IN']);
+        self::assertSame('IN', RequestReader::read(['request' => $symfony], '__pp', 'cf-ipcountry')->country);
+        $psr = (new ServerRequest('GET', 'https://shop.test/'))->withHeader('CloudFront-Viewer-Country', 'DE');
+        self::assertSame('DE', RequestReader::read(['request' => $psr], '__pp', 'cloudfront-viewer-country')->country);
+
+        $_SERVER['HTTP_CF_IPCOUNTRY'] = 'JP';
+        self::assertSame('JP', RequestReader::read([], '__pp', 'cf-ipcountry')->country);
+        self::assertNull(RequestReader::read([], '__pp')->country);
+        self::assertNull(RequestReader::read([], '__pp', 'cloudfront-viewer-country')->country);
+    }
+
+    public function testTheCountryHeaderOptionOverridesTheProjectHeaderInEveryRequestSource(): void
+    {
+        $_SERVER['HTTP_USER_AGENT'] = self::UA;
+        $_SERVER['HTTP_CF_IPCOUNTRY'] = 'BR';
+        $_SERVER['HTTP_X_GEO_COUNTRY'] = 'IN';
+        unset($_SERVER['HTTP_COOKIE']);
+        $_COOKIE = [];
+        $sources = [
+            'superglobals' => [],
+            'symfony' => ['request' => SymfonyRequest::create('https://shop.test/pricing', 'GET', [], [], [], [
+                'HTTP_USER_AGENT' => self::UA,
+                'HTTP_CF_IPCOUNTRY' => 'BR',
+                'HTTP_X_GEO_COUNTRY' => 'IN',
+            ])],
+            'psr-7' => ['request' => (new ServerRequest('GET', 'https://shop.test/'))
+                ->withHeader('User-Agent', self::UA)
+                ->withHeader('CF-IPCountry', 'BR')
+                ->withHeader('X-Geo-Country', 'IN')],
+            'array' => ['request' => ['User-Agent' => self::UA, 'CF-IPCountry' => 'BR', 'X-Geo-Country' => 'IN']],
+        ];
+        [$project] = $this->vectorClient(new FakeClock(self::vectorNow()), null, ['localCurrencies' => true]);
+        [$option] = $this->vectorClient(new FakeClock(self::vectorNow()), null, ['countryHeader' => 'CF-IPCountry', 'localCurrencies' => true]);
+
+        foreach ($sources as $name => $context) {
+            $quotes = [
+                $project->getPrice('geo', $context),
+                $option->getPrice('geo', $context),
+                $option->getPrice('geo', $context + ['country' => 'mx']),
+            ];
+            self::assertSame(
+                [['IN', 'inr', 99900], ['BR', 'usd', 2000], ['MX', 'usd', 2000]],
+                array_map(static fn(Quote $q): array => [$q->country, $q->currency, $q->price], $quotes),
+                $name,
+            );
+        }
     }
 
     public function testFallsBackToSuperglobals(): void
