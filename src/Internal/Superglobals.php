@@ -26,6 +26,11 @@ final class Superglobals
         return $lower === 'cookie' ? self::cookieHeaderFromCookies() : null;
     }
 
+    public function remoteAddress(): mixed
+    {
+        return $_SERVER['REMOTE_ADDR'] ?? null;
+    }
+
     public function scopeKey(): ?string
     {
         $sapi = self::$sapi ?? PHP_SAPI;

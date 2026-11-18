@@ -9,6 +9,7 @@ final class Flight
 {
     public bool $running = false;
     public bool $triedInline = false;
+    public bool $slowReported = false;
 
     public function __construct(
         public readonly int $startedAt,

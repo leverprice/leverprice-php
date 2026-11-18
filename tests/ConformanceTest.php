@@ -5,19 +5,24 @@ declare(strict_types=1);
 namespace Leverprice\Tests;
 
 use Leverprice\Bots;
+use Leverprice\Http\HttpRequest;
+use Leverprice\Http\HttpResponse;
 use Leverprice\Internal\Acceptor;
 use Leverprice\Internal\AssignmentState;
+use Leverprice\Internal\ConfigError;
 use Leverprice\Internal\Cookie;
 use Leverprice\Internal\RequestReader;
+use Leverprice\Internal\Superglobals;
 use Leverprice\Internal\TrustChain;
 use Leverprice\Internal\Util;
 use Leverprice\Internal\Wire;
 use Leverprice\Leverprice;
-use Leverprice\LeverpriceException;
 use Leverprice\Tests\Support\FakeClock;
 use Leverprice\Tests\Support\TestCase;
 use Leverprice\Tests\Support\Vectors;
+use Nyholm\Psr7\ServerRequest;
 use PHPUnit\Framework\Attributes\DataProvider;
+use Symfony\Component\HttpFoundation\Request as SymfonyRequest;
 
 final class ConformanceTest extends TestCase
 {
@@ -40,17 +45,24 @@ final class ConformanceTest extends TestCase
 
         foreach (self::objectList($case->steps) as $i => $step) {
             $now = property_exists($step, 'now') ? self::int($step->now) : self::vectorNow();
+            $refusal = null;
             try {
                 $verified = $acceptor->accept($step->envelope, $now);
                 $outcome = 'accept';
-            } catch (LeverpriceException $e) {
+            } catch (ConfigError $e) {
                 $verified = null;
                 $outcome = 'reject';
+                $refusal = $e->refusal;
             }
             self::assertSame($step->expect, $outcome, sprintf('step %d', $i));
+            // What the next config request reports in Leverprice-Config-Error.
+            self::assertSame($step->code ?? null, $refusal, sprintf('step %d', $i));
             if ($verified !== null) {
                 self::assertSame($step->version, $verified->config->version);
                 self::assertSame($step->dropped, $verified->dropped);
+                if (property_exists($step, 'countryHeader')) {
+                    self::assertSame($step->countryHeader, $verified->config->countryHeader, sprintf('step %d', $i));
+                }
             }
         }
     }
@@ -249,6 +261,150 @@ final class ConformanceTest extends TestCase
         self::assertSame($case['errors'], $this->reported());
     }
 
+    public function testRefusesCountryHeadersThatVisitorsSend(): void
+    {
+        foreach (self::arr(Vectors::arrays()['countryHeaderNames']) as $case) {
+            $case = self::arr($case);
+            self::assertSame($case['allowed'], !RequestReader::visitorSetHeader(self::str($case['name'])), self::str($case['name']));
+        }
+    }
+
+    public function testNormalizesAddresses(): void
+    {
+        foreach (self::arr(Vectors::arrays()['addresses']) as $case) {
+            $case = self::arr($case);
+            self::assertSame($case['address'], RequestReader::normalizeAddress($case['value']), self::envelope($case['value']));
+        }
+    }
+
+    public function testFindsTheClientAddressInEveryRequestShape(): void
+    {
+        $server = $_SERVER;
+        try {
+            foreach (self::arr(Vectors::arrays()['clientAddresses']) as $case) {
+                $case = self::arr($case);
+                /** @var array<string, string> $headers */
+                $headers = self::arr($case['headers']);
+                $remote = isset($case['remoteAddress']) ? ['REMOTE_ADDR' => self::str($case['remoteAddress'])] : [];
+                $cgi = $remote;
+                foreach ($headers as $name => $value) {
+                    $cgi['HTTP_' . strtoupper(str_replace('-', '_', $name))] = $value;
+                }
+                $_SERVER = $cgi;
+                $shapes = [
+                    'array' => $headers + $remote,
+                    'psr-7' => new ServerRequest('GET', 'https://shop.test/', $headers, null, '1.1', $remote),
+                    'symfony' => new SymfonyRequest([], [], [], [], [], $cgi),
+                    'superglobals' => Superglobals::instance(),
+                ];
+                foreach ($shapes as $shape => $request) {
+                    self::assertSame($case['address'], RequestReader::clientAddress($request), $shape . ' ' . self::envelope($case));
+                }
+            }
+        } finally {
+            $_SERVER = $server;
+        }
+    }
+
+    public function testDerivesACookielessVisitorsKey(): void
+    {
+        $key = self::assignmentKey();
+        foreach (self::arr(Vectors::arrays()['anonVisitors']) as $case) {
+            $case = self::arr($case);
+            $message = 'pp:anon:v1:' . self::str($case['address']) . "\n" . self::str($case['userAgent']) . "\n" . self::str($case['acceptLanguage']);
+            self::assertSame($case['message'], $message);
+            self::assertSame($case['v'], Util::hmacHex($key, $message, 32));
+        }
+    }
+
+    public function testNamesItsProductsOnGetConfig(): void
+    {
+        foreach (self::arr(Vectors::arrays()['productsHeader']) as $case) {
+            $case = self::arr($case);
+            $sent = null;
+            [$client] = $this->vectorClient(new FakeClock(self::vectorNow()), static function (HttpRequest $request) use (&$sent): HttpResponse {
+                $sent = $request->headers[Wire::PRODUCTS_HEADER] ?? null;
+
+                return new HttpResponse(503, [], '{}');
+            }, ['products' => self::arr($case['products'])]);
+            $client->refresh();
+            self::assertSame($case['header'], $sent);
+        }
+    }
+
+    /** @return iterable<string, array{array<array-key, mixed>}> */
+    public static function countryHoldCases(): iterable
+    {
+        foreach (self::arr(self::arr(Vectors::arrays()['countryHold'])['cases']) as $case) {
+            $case = self::arr($case);
+            yield self::str($case['name']) => [$case];
+        }
+    }
+
+    /** @param array<array-key, mixed> $case */
+    #[DataProvider('countryHoldCases')]
+    public function testCountryHold(array $case): void
+    {
+        $hold = self::arr(Vectors::arrays()['countryHold']);
+        $key = self::assignmentKey();
+        $clock = new FakeClock(self::vectorNow());
+        $now = intdiv($clock->now, 1000);
+        $headers = ['user-agent' => 'Mozilla/5.0 Chrome/131.0'];
+        if (isset($case['country'])) {
+            $headers['x-geo-country'] = self::str($case['country']);
+        }
+        $t = null;
+        if ($case['cookie'] !== null) {
+            $cookie = self::arr($case['cookie']);
+            $t = isset($cookie['age']) ? $now - self::int($cookie['age']) : null;
+            $state = self::state(['v' => $hold['visitor'], 'a' => $cookie['a'] ?? [], 'x' => $cookie['x'] ?? []]);
+            if (isset($cookie['c'])) {
+                $state->c = self::str($cookie['c']);
+                $state->t = $t;
+            }
+            $headers['cookie'] = '__pp=' . Cookie::sign($key, $state);
+        }
+        $options = ['products' => self::arr($hold['guards'])];
+        if (($case['localCurrencies'] ?? false) === true) {
+            $options['localCurrencies'] = true;
+        }
+        [$client, $transport] = $this->vectorClient($clock, self::vectorApi(self::envelope($hold['config'])), $options);
+
+        $quote = $client->getPrice(self::str($case['productKey']), ['request' => $headers]);
+        $client->flush();
+
+        $back = null;
+        foreach ($quote->setCookie as $header) {
+            if (str_starts_with($header, '__pp=')) {
+                $back = Cookie::verify($key, explode(';', substr($header, 5))[0]);
+                self::assertNotNull($back);
+            }
+        }
+        $actual = [
+            'price' => $quote->price,
+            'currency' => $quote->currency,
+            'country' => $quote->country,
+            'regional' => $quote->regional,
+            'reason' => $quote->reason,
+            'variantId' => $quote->variantId,
+            'exposures' => array_map(static function (array $event): array {
+                unset($event['timestamp'], $event['visitorId']);
+
+                return $event;
+            }, $transport->sentEvents()),
+            'cookie' => $back === null ? null : [
+                'c' => $back->c,
+                't' => $back->t === null ? null : ($back->t === $t ? 'kept' : 'fresh'),
+                'a' => $back->a,
+            ],
+        ];
+        if ($back !== null && $back->t !== null && $back->t !== $t) {
+            self::assertSame($now, $back->t);
+        }
+        self::assertSame(self::arr($case['expect']), $actual);
+        self::assertSame([], $this->errors);
+    }
+
     private static function assignmentKey(): string
     {
         return Util::b64urlDecode(self::str(Vectors::arrays()['assignmentKey']));
@@ -264,14 +420,18 @@ final class ConformanceTest extends TestCase
         }
         /** @var list<string> $x */
         $x = self::arr($raw['x']);
+        $c = $raw['c'] ?? null;
+        $t = $raw['t'] ?? null;
 
-        return new AssignmentState(self::str($raw['v']), $pairs, $x);
+        return new AssignmentState(self::str($raw['v']), $pairs, $x, is_string($c) ? $c : null, is_int($t) ? $t : null);
     }
 
-    /** @return array{v: string, a: list<array{string, string}>, x: list<string>} */
+    /** @return array<string, mixed> */
     private static function plain(AssignmentState $state): array
     {
-        return ['v' => $state->v, 'a' => $state->a, 'x' => $state->x];
+        $plain = ['v' => $state->v, 'a' => $state->a, 'x' => $state->x];
+
+        return $state->c === null ? $plain : $plain + ['c' => $state->c, 't' => $state->t];
     }
 
     /** @return list<\stdClass> */

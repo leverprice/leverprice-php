@@ -177,6 +177,48 @@ final class StateTest extends TestCase
         self::assertSame([], $transport->requests);
     }
 
+    public function testTheNextRequestReportsWhyTheLastConfigWasRefused(): void
+    {
+        $clock = new FakeClock(self::vectorNow());
+        [$first, $firstTransport] = $this->process($clock, static fn(): HttpResponse => new HttpResponse(200, [], 'not json'));
+        self::assertSame(Quote::REASON_NO_CONFIG, $first->getPrice('basic', ['request' => self::BROWSER])->reason);
+        self::assertArrayNotHasKey('Leverprice-Config-Error', $firstTransport->configRequests()[0]->headers);
+
+        $clock->advance(60000);
+        [$second, $secondTransport] = $this->process($clock, static fn(): HttpResponse => new HttpResponse(503, [], '{}'));
+        $second->refresh();
+        self::assertSame('malformed', $secondTransport->configRequests()[0]->headers['Leverprice-Config-Error'] ?? null);
+
+        $clock->advance(60000);
+        [$third, $thirdTransport] = $this->process($clock);
+        self::assertSame(Quote::REASON_BASE_PRICE, $third->getPrice('basic', ['request' => self::BROWSER])->reason);
+        self::assertSame('malformed', $thirdTransport->configRequests()[0]->headers['Leverprice-Config-Error'] ?? null);
+
+        $clock->advance(60000);
+        [$fourth, $fourthTransport] = $this->process($clock);
+        $fourth->refresh();
+        self::assertArrayNotHasKey('Leverprice-Config-Error', $fourthTransport->configRequests()[0]->headers);
+    }
+
+    public function testTheNewestConfigRefusalWinsWhenStatesMerge(): void
+    {
+        $refused = new SharedState();
+        $refused->configError = 'rollback';
+        $refused->configErrorAt = 2000;
+        $stale = new SharedState();
+        self::assertSame(['rollback', 2000], [$stale->merge($refused, 'a')->configError, $stale->merge($refused, 'a')->configErrorAt]);
+
+        $accepted = new SharedState();
+        $accepted->configErrorAt = 3000;
+        self::assertNull($accepted->merge($refused, 'a')->configError);
+
+        $macKey = str_repeat('m', 32);
+        self::assertSame('rollback', SharedState::decode($refused->encode($macKey), $macKey)?->configError);
+        $forged = str_replace('"rollback"', '"x: y"', $refused->encode($macKey));
+        $resigned = hash_hmac('sha256', substr($forged, 65), $macKey) . substr($forged, 64);
+        self::assertNull(SharedState::decode($resigned, $macKey)?->configError);
+    }
+
     public function testTamperedStateFileIsIgnored(): void
     {
         $clock = new FakeClock(self::vectorNow());
@@ -321,11 +363,71 @@ final class StateTest extends TestCase
         $start = $clock->now;
         self::assertSame(Quote::REASON_NO_CONFIG, $second->getPrice('basic', ['request' => self::BROWSER])->reason);
         self::assertSame([], $secondTransport->requests);
-        self::assertSame(400, $clock->now - $start);
+        self::assertSame(500, $clock->now - $start);
 
         [$third, $thirdTransport] = $this->process($clock, self::vectorApi(), $store);
+        $start = $clock->now;
         self::assertSame(Quote::REASON_NO_CONFIG, $third->getPrice('basic', ['request' => self::BROWSER])->reason);
         self::assertSame([], $thirdTransport->requests);
+        self::assertSame(500, $clock->now - $start);
+        self::assertSame(array_fill(0, 3, 'Leverprice config: still loading after 500 ms (timeoutMs); serving fallback prices until it arrives'), $this->errors);
+    }
+
+    public function testALateProcessWaitsItsOwnTimeoutForAnotherProcessFetch(): void
+    {
+        $clock = new FakeClock(self::vectorNow());
+        $store = new FileStore($this->directory);
+        $slow = new \ArrayObject([true]);
+        $api = self::vectorApi();
+        [$first] = $this->process($clock, static function (HttpRequest $r) use ($clock, $slow, $api): HttpResponse {
+            if ($slow[0] === true) {
+                $clock->advance($r->timeoutMs);
+
+                throw new TransportException('timed out', true);
+            }
+
+            return $api($r);
+        }, $store);
+        $start = $clock->now;
+        self::assertSame(Quote::REASON_NO_CONFIG, $first->getPrice('basic', ['request' => self::BROWSER])->reason);
+
+        // A second worker takes a request 400 ms after the first one's fetch started; that fetch
+        // (finished after the first response was sent) lands in the shared store at 600 ms.
+        $clock->now = $start + 400;
+        $finishFirst = static function () use ($first, $slow): void {
+            $slow[0] = false;
+            $first->terminate();
+        };
+        $shared = new class ($store, $clock, $start + 600, $finishFirst) implements StateStore {
+            private bool $finished = false;
+
+            public function __construct(
+                private readonly StateStore $inner,
+                private readonly FakeClock $clock,
+                private readonly int $finishAt,
+                private readonly \Closure $finish,
+            ) {}
+
+            public function read(string $key): ?string
+            {
+                if (!$this->finished && $this->clock->now >= $this->finishAt) {
+                    $this->finished = true;
+                    ($this->finish)();
+                }
+
+                return $this->inner->read($key);
+            }
+
+            public function write(string $key, string $value): bool
+            {
+                return $this->inner->write($key, $value);
+            }
+        };
+        [$second, $secondTransport] = $this->process($clock, self::vectorApi(), $shared);
+        $quote = $second->getPrice('basic', ['request' => self::BROWSER]);
+        self::assertSame(Quote::REASON_BASE_PRICE, $quote->reason);
+        self::assertSame([], $secondTransport->requests);
+        self::assertLessThan($start + 900, $clock->now);
     }
 
     public function testDefaultStoreIsApcuOrATempFile(): void

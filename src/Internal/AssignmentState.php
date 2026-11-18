@@ -12,11 +12,15 @@ final class AssignmentState
     /**
      * @param list<array{string, string}> $a
      * @param list<string> $x
+     * @param ?string $c the country whose price the visitor holds
+     * @param ?int $t when that country was set, in seconds since the epoch
      */
     public function __construct(
         public string $v,
         public array $a = [],
         public array $x = [],
+        public ?string $c = null,
+        public ?int $t = null,
     ) {}
 
     public function variantFor(string $experimentId): ?string
@@ -60,6 +64,10 @@ final class AssignmentState
             $a[] = Util::jsonEncode($exp) . ':' . Util::jsonEncode($variant);
         }
 
-        return '{"v":' . Util::jsonEncode($this->v) . ',"a":{' . implode(',', $a) . '},"x":' . Util::jsonEncode($this->x) . '}';
+        $held = $this->c !== null && $this->t !== null
+            ? ',"c":' . Util::jsonEncode($this->c) . ',"t":' . $this->t
+            : '';
+
+        return '{"v":' . Util::jsonEncode($this->v) . ',"a":{' . implode(',', $a) . '},"x":' . Util::jsonEncode($this->x) . $held . '}';
     }
 }

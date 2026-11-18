@@ -11,6 +11,12 @@ final class Wire
 {
     public const PROTOCOL_VERSION = 2;
     public const CONFIG_VERSION_HEADER = 'Leverprice-Config-Version';
+    public const PRODUCTS_HEADER = 'Leverprice-Products';
+    public const CONFIG_ERROR_HEADER = 'Leverprice-Config-Error';
+    public const MAX_REPORTED_PRODUCTS = 50;
+    /** The level of a country without a regional price: the standard price. */
+    public const STANDARD_LEVEL = 10000;
+    public const MAX_COUNTRY_HOLD = 90 * 86400;
     public const MAX_EVENTS_PER_REQUEST = 500;
     public const MAX_REGIONS = 300;
     public const MAX_SPLITS = 300;
@@ -91,6 +97,7 @@ final class Wire
                 $fingerprints,
                 self::headerName(Util::prop($raw, 'countryHeader')),
                 $parsed,
+                self::countryHold(Util::prop($raw, 'countryHold')),
             ),
             $dropped,
         ];
@@ -265,7 +272,15 @@ final class Wire
             if (!is_string($currency) || preg_match('/^[A-Za-z]{3}$/D', $currency) !== 1) {
                 return null;
             }
-            $regions[] = new Region(count($regions), $countries, strtolower($currency), $price);
+            // A level this SDK can't read compares as the standard price: it never holds a price.
+            $level = Util::safeInt(Util::prop($r, 'level'));
+            $regions[] = new Region(
+                count($regions),
+                $countries,
+                strtolower($currency),
+                $price,
+                $level !== null && $level > 0 ? $level : self::STANDARD_LEVEL,
+            );
         }
 
         return $regions;
@@ -431,7 +446,16 @@ final class Wire
 
     private static function headerName(mixed $v): ?string
     {
-        return is_string($v) && preg_match(self::HEADER_NAME_RE, $v) === 1 ? strtolower($v) : null;
+        return is_string($v) && preg_match(self::HEADER_NAME_RE, $v) === 1 && !RequestReader::visitorSetHeader($v)
+            ? strtolower($v)
+            : null;
+    }
+
+    private static function countryHold(mixed $v): int
+    {
+        $seconds = Util::safeInt($v);
+
+        return $seconds !== null && $seconds > 0 && $seconds <= self::MAX_COUNTRY_HOLD ? $seconds : 0;
     }
 
     private static function keyLength(string $b64): int

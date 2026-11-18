@@ -4,8 +4,6 @@ declare(strict_types=1);
 
 namespace Leverprice\Internal;
 
-use Leverprice\LeverpriceException;
-
 /** @internal */
 final class Acceptor
 {
@@ -32,23 +30,24 @@ final class Acceptor
         return $this->signingKey === null || $this->trust->isTrusted($this->signingKey);
     }
 
+    /** @throws ConfigError */
     public function accept(mixed $envelope, int $now): VerifiedConfig
     {
         $verified = $this->trust->verify($envelope, $now);
         $config = $verified->config;
         if (!in_array($this->fingerprint, $config->keyFingerprints, true)) {
-            throw new LeverpriceException('Leverprice config: not issued for this API key; refusing');
+            throw new ConfigError(ConfigError::WRONG_KEY, 'Leverprice config: not issued for this API key; refusing');
         }
         $current = $this->config;
         if ($current !== null && $config->projectId !== $current->projectId) {
-            throw new LeverpriceException(sprintf(
+            throw new ConfigError(ConfigError::WRONG_PROJECT, sprintf(
                 'Leverprice config: project changed from %s to %s; refusing',
                 $current->projectId,
                 $config->projectId,
             ));
         }
         if ($current !== null && $config->version < $current->version) {
-            throw new LeverpriceException(sprintf(
+            throw new ConfigError(ConfigError::ROLLBACK, sprintf(
                 'Leverprice config: refusing to roll back from version %d to %d',
                 $current->version,
                 $config->version,

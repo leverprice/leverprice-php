@@ -7,6 +7,7 @@ namespace Leverprice\Tests;
 use Leverprice\Http\HttpRequest;
 use Leverprice\Http\HttpResponse;
 use Leverprice\Http\TransportException;
+use Leverprice\Internal\Cookie;
 use Leverprice\Internal\Ed25519;
 use Leverprice\Internal\Util;
 use Leverprice\Leverprice;
@@ -15,6 +16,7 @@ use Leverprice\State\MemoryStore;
 use Leverprice\Tests\Support\FakeClock;
 use Leverprice\Tests\Support\FakeTransport;
 use Leverprice\Tests\Support\TestCase;
+use Leverprice\Tests\Support\Vectors;
 use PHPUnit\Framework\Attributes\DataProvider;
 
 final class ClientTest extends TestCase
@@ -215,6 +217,38 @@ final class ClientTest extends TestCase
         }
     }
 
+    public function testIgnoresACountryHeaderThatBrowsersSendAndSaysSoOnce(): void
+    {
+        foreach (['Accept-Language', 'x-forwarded-for', 'X-Real-IP', 'sec-ch-ua', 'user-agent'] as $header) {
+            $this->errors = [];
+            [$client] = $this->vectorClient(new FakeClock(self::vectorNow()), null, ['countryHeader' => $header]);
+            self::assertSame([sprintf(
+                'Leverprice: countryHeader "%s" is sent by visitors\' browsers, so it would let them pick their own price; it is ignored. Name the header your CDN or host sets, such as cf-ipcountry.',
+                strtolower($header),
+            )], $this->errors, $header);
+            $quote = $client->getPrice('geo', ['request' => [$header => 'IN']]);
+            self::assertSame([null, 2900], [$quote->country, $quote->price], $header);
+            self::assertCount(1, $this->reported(), $header);
+        }
+        foreach (['cf-ipcountry', 'x-vercel-ip-country', 'X-Geo-Country'] as $header) {
+            $this->errors = [];
+            [$client] = $this->vectorClient(new FakeClock(self::vectorNow()), null, ['countryHeader' => $header]);
+            $quote = $client->getPrice('geo', ['request' => self::BROWSER + [$header => 'BR']]);
+            self::assertSame(['BR', 2000], [$quote->country, $quote->price], $header);
+            self::assertSame([], $this->reported(), $header);
+        }
+
+        $this->errors = [];
+        $this->client(null, ['countryHeader' => 'accept-language', 'disabled' => true]);
+        putenv('LEVERPRICE_DISABLED=1');
+        $this->client(null, ['countryHeader' => 'accept-language']);
+        self::assertSame([], $this->errors);
+        putenv('LEVERPRICE_DISABLED');
+        $this->client(null, ['countryHeader' => 'accept-language', 'secretKey' => 'malformed']);
+        self::assertCount(2, $this->errors);
+        self::assertStringContainsString('countryHeader "accept-language" is sent by visitors', implode("\n", $this->errors));
+    }
+
     public function testCountryHeaderIsNormalized(): void
     {
         $guard = ['currency' => 'USD', 'fallbackPrice' => 2900];
@@ -317,6 +351,136 @@ final class ClientTest extends TestCase
         }
     }
 
+    public function testACookielessVisitorWithAnAddressIsOneVisitor(): void
+    {
+        $clock = new FakeClock(self::vectorNow());
+        [$client, $transport] = $this->vectorClient($clock);
+        $request = self::BROWSER + ['accept-language' => 'en-US,en;q=0.9', 'x-forwarded-for' => '198.51.100.23, 10.0.0.1'];
+        $quotes = [];
+        for ($i = 0; $i < 20; $i++) {
+            $quotes[] = $client->getPrice('pro', ['request' => $request]);
+        }
+        $client->flush();
+        self::assertCount(1, array_unique(array_map(static fn(Quote $q): string => $q->visitorId . ' ' . $q->variantId, $quotes)));
+        self::assertCount(1, $transport->sentEvents());
+
+        [$nextRequest] = $this->vectorClient($clock);
+        self::assertSame($quotes[0]->visitorId, $nextRequest->getPrice('pro', ['request' => $request])->visitorId);
+        $otherBrowser = $nextRequest->getPrice('pro', ['request' => ['accept-language' => 'de-DE'] + $request]);
+        self::assertNotSame($quotes[0]->visitorId, $otherBrowser->visitorId);
+        self::assertSame([], $this->reported());
+    }
+
+    public function testACookielessVisitorWithoutAnAddressIsNewEveryTime(): void
+    {
+        [$client, $transport] = $this->vectorClient(new FakeClock(self::vectorNow()));
+        $visitors = [];
+        for ($i = 0; $i < 20; $i++) {
+            $visitors[] = $client->getPrice('pro', ['request' => self::BROWSER + ['accept-language' => 'en']])->visitorId;
+        }
+        $client->flush();
+        self::assertCount(20, array_unique($visitors));
+        self::assertCount(20, $transport->sentEvents());
+    }
+
+    public function testOneRequestCarriesTheHeldCountryAndTheAssignmentInItsLastCookie(): void
+    {
+        $hold = self::arr(Vectors::arrays()['countryHold']);
+        [$client] = $this->vectorClient(
+            new FakeClock(self::vectorNow()),
+            self::vectorApi(self::envelope($hold['config'])),
+            ['products' => self::arr($hold['guards'])],
+        );
+        $key = Util::b64urlDecode(self::str(Vectors::arrays()['assignmentKey']));
+        $page = (object) ['headers' => self::BROWSER + ['x-geo-country' => 'US']];
+
+        $geo = $client->getPrice('geo', ['request' => $page]);
+        $test = $client->getPrice('geotest', ['request' => $page]);
+        self::assertSame([Quote::REASON_BASE_PRICE, 'US'], [$geo->reason, $geo->country]);
+        self::assertCount(1, $geo->setCookie);
+        self::assertCount(1, $test->setCookie);
+        $cookie = explode(';', $test->setCookie[0])[0];
+        $state = Cookie::verify($key, substr($cookie, 5));
+        self::assertNotNull($state);
+        self::assertSame(['US', [['exp_H', (string) $test->variantId]]], [$state->c, $state->a]);
+
+        $vpn = $client->getPrice('geotest', ['request' => self::BROWSER + ['x-geo-country' => 'IN', 'cookie' => $cookie]]);
+        self::assertSame(
+            [$test->variantId, $test->price, 'US', false, []],
+            [$vpn->variantId, $vpn->price, $vpn->country, $vpn->regional, $vpn->setCookie],
+        );
+
+        $bot = $client->getPrice('geo', ['request' => ['user-agent' => 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)', 'x-geo-country' => 'IN', 'cookie' => $cookie]]);
+        self::assertSame([Quote::REASON_BOT, 2900, null, []], [$bot->reason, $bot->price, $bot->country, $bot->setCookie]);
+        self::assertSame([], $this->errors);
+    }
+
+    public function testNamesItsProductsOnEveryConfigRequest(): void
+    {
+        $clock = new FakeClock(1800000000000);
+        $status = new \ArrayObject([503]);
+        [$client, $transport] = $this->client(static fn(HttpRequest $r): HttpResponse => new HttpResponse((int) $status[0], [], '{}'), ['products' => [
+            'team' => ['currency' => 'EUR', 'fallbackPrice' => 4900],
+            'pro plan' => ['currency' => 'usd', 'fallbackPrice' => 1900],
+            "\u{00E9}t\u{00E9}" => ['currency' => 'usd', 'fallbackPrice' => 900],
+        ]], $clock);
+        $client->refresh();
+        $client->refresh();
+        $status[0] = 304;
+        $clock->advance(60000);
+        self::assertSame(Quote::REASON_NO_CONFIG, $client->getPrice('team')->reason);
+
+        $requests = $transport->configRequests();
+        self::assertCount(3, $requests);
+        foreach ($requests as $request) {
+            self::assertSame('%C3%A9t%C3%A9=usd, pro%20plan=usd, team=eur', $request->headers['Leverprice-Products'] ?? null);
+            self::assertArrayNotHasKey('Leverprice-Config-Error', $request->headers);
+        }
+        self::assertSame('Leverprice config: HTTP 304', end($this->errors));
+    }
+
+    public function testSaysWhyItRefusedTheLastConfigUntilOneIsAccepted(): void
+    {
+        $otherKeys = null;
+        foreach (self::arr(Vectors::objects()->trust) as $case) {
+            self::assertInstanceOf(\stdClass::class, $case);
+            if ($case->name === 'small issued for other API keys') {
+                $step = self::arr($case->steps)[0];
+                self::assertInstanceOf(\stdClass::class, $step);
+                $otherKeys = self::envelope($step->envelope);
+            }
+        }
+        self::assertNotNull($otherKeys);
+        $valid = self::envelope(Vectors::objects()->config);
+        $responses = [
+            new HttpResponse(200, [], 'not json'),
+            new HttpResponse(503, [], '{}'),
+            new HttpResponse(200, [], '{"payload":"x"}'),
+            new HttpResponse(200, [], $otherKeys),
+            new HttpResponse(200, ['ETag' => '"v5"'], $valid),
+            new HttpResponse(200, ['ETag' => '"v5"'], $valid),
+        ];
+        [$client, $transport] = $this->vectorClient(
+            new FakeClock(self::vectorNow()),
+            static function () use (&$responses): HttpResponse {
+                return array_shift($responses) ?? new HttpResponse(503, [], '{}');
+            },
+        );
+        for ($i = 0; $i < 6; $i++) {
+            $client->refresh();
+        }
+
+        $requests = $transport->configRequests();
+        self::assertSame(
+            [null, 'malformed', 'malformed', 'malformed', 'wrong_key', null],
+            array_map(static fn(HttpRequest $r): ?string => $r->headers['Leverprice-Config-Error'] ?? null, $requests),
+        );
+        foreach ($requests as $request) {
+            self::assertArrayHasKey('Leverprice-Products', $request->headers);
+        }
+        self::assertSame(Quote::REASON_BASE_PRICE, $client->getPrice('basic', ['request' => self::BROWSER])->reason);
+    }
+
     public function testUnknownProductIsACallerBug(): void
     {
         [$client] = $this->client();
@@ -333,7 +497,7 @@ final class ClientTest extends TestCase
             self::assertSame(32, strlen(Util::b64urlDecode($key)));
         }
         self::assertSame(1, Leverprice::MIN_KEYSET_VERSION);
-        self::assertSame('0.4.0', Leverprice::SDK_VERSION);
+        self::assertSame('0.4.1', Leverprice::SDK_VERSION);
     }
 
     public function testColdStartThatTimesOutReturnsNoConfigWithinTimeout(): void
@@ -357,14 +521,19 @@ final class ClientTest extends TestCase
         self::assertSame(['__pp_f=1; Path=/; Max-Age=1800; SameSite=Lax; HttpOnly; Secure'], $quote->setCookie);
         self::assertLessThanOrEqual(500, $clock->now - $start);
         self::assertSame(500, $transport->configRequests()[0]->timeoutMs);
+        self::assertSame(['Leverprice config: still loading after 500 ms (timeoutMs); serving fallback prices until it arrives'], $this->errors);
 
+        // The next visitor gets its own timeoutMs, not what is left of the first one's.
+        $start = $clock->now;
         self::assertSame(Quote::REASON_NO_CONFIG, $client->getPrice('basic', ['request' => self::BROWSER])->reason);
-        self::assertCount(1, $transport->configRequests());
-        self::assertSame([], $this->errors);
+        self::assertSame(500, $clock->now - $start);
+        self::assertCount(2, $transport->configRequests());
+        self::assertSame(500, $transport->configRequests()[1]->timeoutMs);
+        self::assertSame(['Leverprice config: still loading after 500 ms (timeoutMs); serving fallback prices until it arrives'], $this->errors);
 
         $slow[0] = false;
         $client->terminate();
-        self::assertSame(10000, $transport->configRequests()[1]->timeoutMs);
+        self::assertSame(10000, $transport->configRequests()[2]->timeoutMs);
         self::assertSame(Quote::REASON_BASE_PRICE, $client->getPrice('basic', ['request' => self::BROWSER])->reason);
     }
 
@@ -378,11 +547,14 @@ final class ClientTest extends TestCase
         }, ['timeoutMs' => 20], $clock);
 
         self::assertSame(Quote::REASON_NO_CONFIG, $client->getPrice('pro')->reason);
+        // The next visitor retries the same flight within its own timeoutMs.
         self::assertSame(Quote::REASON_NO_CONFIG, $client->getPrice('pro')->reason);
-        self::assertCount(1, $transport->requests);
+        self::assertCount(2, $transport->requests);
+        $flight = (new \ReflectionProperty(Leverprice::class, 'flight'))->getValue($client);
         $clock->advance(16000);
         $client->getPrice('pro');
-        self::assertCount(2, $transport->requests);
+        self::assertCount(3, $transport->requests);
+        self::assertNotSame($flight, (new \ReflectionProperty(Leverprice::class, 'flight'))->getValue($client));
     }
 
     public function testOutageSetsThePinAndPinnedBrowsersKeepTheFallback(): void
@@ -517,12 +689,12 @@ final class ClientTest extends TestCase
 
         $request = $transport->eventRequests()[0];
         self::assertSame('Bearer ' . self::SECRET_KEY, $request->headers['Authorization']);
-        self::assertSame('leverprice-sdk-php/0.4.0', $request->headers['User-Agent']);
+        self::assertSame('leverprice-sdk-php/0.4.1', $request->headers['User-Agent']);
         self::assertSame('application/json', $request->headers['Content-Type']);
         self::assertArrayNotHasKey('Origin', $request->headers);
         self::assertSame('https://api.leverprice.com/v1/events', $request->url);
         $body = self::arr(json_decode((string) $request->body, true, 512, JSON_THROW_ON_ERROR));
-        self::assertSame(['name' => 'leverprice-php', 'version' => '0.4.0'], $body['sdk']);
+        self::assertSame(['name' => 'leverprice-php', 'version' => '0.4.1'], $body['sdk']);
         self::assertSame([[
             'type' => 'purchase',
             'provider' => 'stripe',

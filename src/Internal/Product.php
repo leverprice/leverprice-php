@@ -33,4 +33,9 @@ final class Product
     {
         return $this->regionOf[$country] ?? null;
     }
+
+    public function hasRegions(): bool
+    {
+        return $this->regionOf !== [];
+    }
 }

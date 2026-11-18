@@ -35,7 +35,8 @@ final class CurlTransport implements Transport
         $tooLarge = false;
         $lines = ['Expect:'];
         foreach ($request->headers as $name => $value) {
-            $lines[] = $name . ': ' . $value;
+            // curl drops "Name:" with nothing after it; "Name;" sends the header with an empty value.
+            $lines[] = $value === '' ? $name . ';' : $name . ': ' . $value;
         }
         $timeout = max(1, $request->timeoutMs);
         $options = [

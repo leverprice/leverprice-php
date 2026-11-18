@@ -192,6 +192,38 @@ final class WireTest extends TestCase
         foreach ([null, '', ' cf-ipcountry', "cf-ipcountry\n", 'cf ipcountry', 'cf-ipcountry:', "\u{212A}ey", 42, true, ['cf-ipcountry']] as $value) {
             self::assertNull($header($value), self::envelope($value));
         }
+        foreach (['Accept-Language', 'X-Forwarded-For', 'x-real-ip', 'Sec-CH-UA', 'User-Agent', 'Cookie'] as $value) {
+            self::assertNull($header($value), $value);
+        }
+    }
+
+    public function testReadsTheCountryHoldAndRegionLevels(): void
+    {
+        $hold = static fn(mixed $value): int => Wire::parseConfig(self::payload(['flat' => self::PRODUCT], ['countryHold' => $value]))[0]->countryHold;
+
+        self::assertSame(0, Wire::parseConfig(self::payload(['flat' => self::PRODUCT]))[0]->countryHold);
+        self::assertSame(604800, $hold(604800));
+        self::assertSame(604800, $hold(604800.0));
+        self::assertSame(Wire::MAX_COUNTRY_HOLD, $hold(7776000));
+        foreach ([0, -1, 7776001, 1.5, '604800', true, null, [604800]] as $value) {
+            self::assertSame(0, $hold($value), self::envelope($value));
+        }
+
+        $levels = [12069, 4138.0, null, 0, -5, 1.5, '4138', true];
+        $regions = [];
+        foreach ($levels as $i => $level) {
+            $regions[] = self::region([self::codes(count($levels))[$i]], 'usd', 2000) + ($level === null ? [] : ['level' => $level]);
+        }
+        [$config, $dropped] = Wire::parseConfig(self::payload(['geo' => self::PRODUCT + ['regions' => $regions]]));
+        self::assertSame([], $dropped);
+        $geo = $config->product('geo');
+        self::assertNotNull($geo);
+        self::assertTrue($geo->hasRegions());
+        self::assertFalse(Wire::parseConfig(self::payload(['flat' => self::PRODUCT]))[0]->product('flat')?->hasRegions());
+        self::assertSame(
+            [12069, 4138, 10000, 10000, 10000, 10000, 10000, 10000],
+            array_map(static fn(string $code): ?int => $geo->region($code)?->level, self::codes(count($levels))),
+        );
     }
 
     public function testExposureCountryIsAnUppercaseTwoLetterCodeOrAbsent(): void

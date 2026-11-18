@@ -81,6 +81,12 @@ final class Cookie
             }
             $state->x = array_slice($state->x, 0, AssignmentState::MAX_EXPERIMENTS);
         }
+        $c = Util::prop($raw, 'c');
+        $t = Util::safeInt(Util::prop($raw, 't'));
+        if (is_string($c) && Util::isCountry($c) && $t !== null && $t >= 0) {
+            $state->c = $c;
+            $state->t = $t;
+        }
 
         return $state;
     }

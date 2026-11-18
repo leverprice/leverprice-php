@@ -64,18 +64,23 @@ final class TrustChain
         return false;
     }
 
+    /** @throws ConfigError */
     public function verify(mixed $envelope, int $now): VerifiedConfig
     {
         if (!$envelope instanceof \stdClass) {
-            throw new LeverpriceException('Leverprice config: response is not a signed config');
+            throw new ConfigError(ConfigError::MALFORMED, 'Leverprice config: response is not a signed config');
         }
         $payload = Util::prop($envelope, 'payload');
         $signature = Util::prop($envelope, 'signature');
         $keyId = Util::prop($envelope, 'keyId');
         if (!is_string($payload) || !is_string($signature) || !is_string($keyId)) {
-            throw new LeverpriceException('Leverprice config: response is not a signed config');
+            throw new ConfigError(ConfigError::MALFORMED, 'Leverprice config: response is not a signed config');
         }
-        $keyset = $this->verifyKeyset(Util::prop($envelope, 'keyset'), $now);
+        try {
+            $keyset = $this->verifyKeyset(Util::prop($envelope, 'keyset'), $now);
+        } catch (\Throwable $e) {
+            throw ConfigError::wrap(ConfigError::UNTRUSTED, $e);
+        }
         $key = null;
         foreach ($keyset->keys as $k) {
             if ($k->id === $keyId) {
@@ -84,14 +89,21 @@ final class TrustChain
             }
         }
         if ($key === null) {
-            throw new LeverpriceException(sprintf('Leverprice config: signing key "%s" is not in keyset v%d', $keyId, $keyset->version));
+            throw new ConfigError(
+                ConfigError::BAD_SIGNATURE,
+                sprintf('Leverprice config: signing key "%s" is not in keyset v%d', $keyId, $keyset->version),
+            );
         }
         if (!Ed25519::verify($key->publicKey, $signature, $payload)) {
-            throw new LeverpriceException(sprintf('Leverprice config: bad signature (key "%s")', $keyId));
+            throw new ConfigError(ConfigError::BAD_SIGNATURE, sprintf('Leverprice config: bad signature (key "%s")', $keyId));
         }
-        [$config, $dropped] = Wire::parseConfig($payload);
+        try {
+            [$config, $dropped] = Wire::parseConfig($payload);
+        } catch (\Throwable $e) {
+            throw ConfigError::wrap(ConfigError::MALFORMED, $e);
+        }
         if ($now >= $config->expiresAt) {
-            throw new LeverpriceException(sprintf(
+            throw new ConfigError(ConfigError::EXPIRED, sprintf(
                 'Leverprice config v%d: expired at %s',
                 $config->version,
                 Util::isoTime($config->expiresAt),

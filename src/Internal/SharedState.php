@@ -27,6 +27,9 @@ final class SharedState
     public int $eventsRetryAt = 0;
     public int $outboxSize = 0;
     public bool $outboxTouched = false;
+    /** Why the last config body was refused, sent with the next fetch; null once one is accepted. */
+    public ?string $configError = null;
+    public int $configErrorAt = 0;
 
     public function encode(string $macKey): string
     {
@@ -48,6 +51,8 @@ final class SharedState
             'eventFailures' => $this->eventFailures,
             'eventsRetryAt' => $this->eventsRetryAt,
             'outboxSize' => $this->outboxSize,
+            'configError' => $this->configError,
+            'configErrorAt' => $this->configErrorAt,
         ]);
 
         return hash_hmac('sha256', $json, $macKey) . "\n" . $json;
@@ -91,6 +96,9 @@ final class SharedState
         $s->eventFailures = self::int($raw['eventFailures'] ?? 0);
         $s->eventsRetryAt = self::int($raw['eventsRetryAt'] ?? 0);
         $s->outboxSize = self::int($raw['outboxSize'] ?? 0);
+        $configError = $raw['configError'] ?? null;
+        $s->configError = in_array($configError, ConfigError::CODES, true) ? $configError : null;
+        $s->configErrorAt = self::int($raw['configErrorAt'] ?? 0);
 
         return $s;
     }
@@ -119,6 +127,10 @@ final class SharedState
         $out->outboxSize = $this->outboxTouched ? $this->outboxSize : $stored->outboxSize;
         $out->serverVersion = max($this->serverVersion, $stored->serverVersion);
         $out->catchUpAt = max($this->catchUpAt, $stored->catchUpAt);
+        if ($stored->configErrorAt > $this->configErrorAt) {
+            $out->configError = $stored->configError;
+            $out->configErrorAt = $stored->configErrorAt;
+        }
         if ($this->leaseOwner === $owner && $this->leaseSince > 0) {
             return $out;
         }

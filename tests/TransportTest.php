@@ -75,7 +75,7 @@ final class TransportTest extends TestCase
     public function testSendsRequestsAndReadsResponses(Transport $transport): void
     {
         $this->requireServer();
-        $get = $transport->send(new HttpRequest('GET', self::$base . '/v1/config', ['Authorization' => 'Bearer x', 'If-None-Match' => '"v1"'], null, 5000));
+        $get = $transport->send(new HttpRequest('GET', self::$base . '/v1/config', ['Authorization' => 'Bearer x', 'If-None-Match' => '"v1"', 'Leverprice-Products' => ''], null, 5000));
         self::assertSame(200, $get->status);
         self::assertTrue($get->ok());
         self::assertSame('"v9"', $get->header('etag'));
@@ -85,6 +85,7 @@ final class TransportTest extends TestCase
         self::assertSame('GET', $echo['method']);
         self::assertSame('Bearer x', $headers['authorization']);
         self::assertSame('"v1"', $headers['if-none-match']);
+        self::assertSame('', $headers['leverprice-products'] ?? null);
         self::assertArrayNotHasKey('origin', $headers);
 
         $body = str_repeat('{"events":[]}', 200);
@@ -190,7 +191,7 @@ final class TransportTest extends TestCase
         $lp->trackPurchase(['provider' => 'stripe', 'orderId' => 'pi_1', 'amount' => 1, 'currency' => 'usd']);
         $last = end($client->requests);
         self::assertInstanceOf(RequestInterface::class, $last);
-        self::assertSame('leverprice-sdk-php/0.4.0', $last->getHeaderLine('User-Agent'));
+        self::assertSame('leverprice-sdk-php/0.4.1', $last->getHeaderLine('User-Agent'));
     }
 
     public function testHttpResponseHeaders(): void
